@@ -351,7 +351,12 @@ public class Executor {
     Code statusCode;
     try (IOResource resource =
         workerContext.limitExecution(
-            executionName, execOwner, arguments, executionContext.command, workingDirectory)) {
+            executionName,
+            execOwner,
+            arguments,
+            executionContext.command,
+            workingDirectory,
+            shouldRunOnPersistentWorker(limits))) {
       // Apply all other custom execution policies AFTER built-in wrappers
       for (ExecutionPolicy policy : policies) {
         if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
