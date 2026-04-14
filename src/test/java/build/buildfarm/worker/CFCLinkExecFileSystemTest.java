@@ -401,7 +401,7 @@ public class CFCLinkExecFileSystemTest {
     try {
       assertThat(fetchResult).isNotNull();
       assertThat(fetchResult.entries()).isNotEmpty();
-      // src/ is not in linkedInputExclusions (output is at out/), so it should be a DIRECTORY entry
+      // src/ matches the whitelist and does not overlap the output, so it is a DIRECTORY entry.
       assertThat(fetchResult.entries()).hasSize(1);
       assertThat(fetchResult.entries().get(0).type())
           .isEqualTo(build.buildfarm.worker.persistent.FetchResult.EntryType.DIRECTORY);
@@ -513,7 +513,7 @@ public class CFCLinkExecFileSystemTest {
   }
 
   @Test
-  public void fetchAndRefInputs_linkedInputExclusionsDeterminesGranularity() throws Exception {
+  public void fetchAndRefInputs_outputPathsDetermineGranularity() throws Exception {
     // Build tree: root -> {src (safe), out (has output)}
     // src should be a DIRECTORY entry, files in out should be individual FILE entries
     Directory emptyDir = Directory.getDefaultInstance();
@@ -539,7 +539,7 @@ public class CFCLinkExecFileSystemTest {
             DigestUtil.toDigest(rootDirDigest), rootDir,
             DigestUtil.toDigest(emptyDirDigest), emptyDir);
 
-    // Output is under out/ — so out is in linkedInputExclusions, src is not
+    // Output is under out/, so it stays real while whitelisted src/ can be linked as a unit.
     Command command = Command.newBuilder().addOutputPaths("out/output.jar").build();
     Action action =
         Action.newBuilder().setInputRootDigest(DigestUtil.toDigest(rootDirDigest)).build();
@@ -555,7 +555,7 @@ public class CFCLinkExecFileSystemTest {
 
     try {
       // src/ is safe to symlink → DIRECTORY entry
-      // out/ is in linkedInputExclusions → descended into (but empty, so no file entries)
+      // out/ overlaps the output and is descended into (but empty, so no file entries).
       boolean hasSrcDir =
           fetchResult.entries().stream()
               .anyMatch(
@@ -565,7 +565,7 @@ public class CFCLinkExecFileSystemTest {
                               == build.buildfarm.worker.persistent.FetchResult.EntryType.DIRECTORY);
       assertThat(hasSrcDir).isTrue();
 
-      // out/ should NOT appear as a DIRECTORY entry (it's in linkedInputExclusions)
+      // out/ should not appear as a DIRECTORY entry because it overlaps the output.
       boolean hasOutDir =
           fetchResult.entries().stream()
               .anyMatch(
