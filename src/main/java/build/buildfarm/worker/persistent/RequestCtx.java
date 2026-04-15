@@ -16,7 +16,11 @@ package build.buildfarm.worker.persistent;
 
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.protobuf.Duration;
+import java.nio.file.Path;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.annotation.Nullable;
 import persistent.common.CtxAround;
 
 public class RequestCtx implements CtxAround<WorkRequest> {
@@ -34,9 +38,25 @@ public class RequestCtx implements CtxAround<WorkRequest> {
 
   private volatile String outcome = PersistentWorkerMetrics.OUTCOME_WORKER_ERROR;
 
+  /** FetchResult from InputFetcher — carries CAS paths and ref keys for deferred linking. */
+  @Nullable public final FetchResult fetchResult;
+
+  /**
+   * Tracks paths created in the worker exec root during preWorkInit (directory symlinks, file
+   * hardlinks, zero-size files, symlink nodes). Populated incrementally during link creation. Read
+   * during postWorkCleanup to delete all created links.
+   */
+  final Set<Path> trackedLinks = new HashSet<>();
+
   public RequestCtx(
       WorkRequest request, WorkFilesContext ctx, WorkerInputs workFiles, Duration timeout) {
-    this(request, ctx, workFiles, timeout, PersistentWorkerMetrics.startTimer());
+    this(
+        request,
+        ctx,
+        workFiles,
+        timeout,
+        /* fetchResult= */ null,
+        PersistentWorkerMetrics.startTimer());
   }
 
   public RequestCtx(
@@ -44,12 +64,23 @@ public class RequestCtx implements CtxAround<WorkRequest> {
       WorkFilesContext ctx,
       WorkerInputs workFiles,
       Duration timeout,
+      @Nullable FetchResult fetchResult) {
+    this(request, ctx, workFiles, timeout, fetchResult, PersistentWorkerMetrics.startTimer());
+  }
+
+  public RequestCtx(
+      WorkRequest request,
+      WorkFilesContext ctx,
+      WorkerInputs workFiles,
+      Duration timeout,
+      @Nullable FetchResult fetchResult,
       long metricsStartedNanos) {
     this.request = request;
     this.filesContext = ctx;
     this.workerInputs = workFiles;
     this.timeout = timeout;
     this.metricsStartedNanos = metricsStartedNanos;
+    this.fetchResult = fetchResult;
   }
 
   @Override
