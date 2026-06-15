@@ -984,6 +984,12 @@
       },
       "version": "1.37"
     },
+    "org.openjdk.jol:jol-core": {
+      "shasums": {
+        "jar": "bd73d9ad265d8478ccde06130200877f3a4f0a6e2d44e7fb8cbb2e6f4104cbdc"
+      },
+      "version": "0.17"
+    },
     "org.ow2.asm:asm": {
       "shasums": {
         "jar": "3c6fac2424db3d4a853b669f4e3d1d9c3c552235e19a319673f887083c2303a1"
@@ -3832,6 +3838,15 @@
       "org.openjdk.jmh.generators",
       "org.openjdk.jmh.generators.annotations"
     ],
+    "org.openjdk.jol:jol-core": [
+      "org.openjdk.jol.datamodel",
+      "org.openjdk.jol.heap",
+      "org.openjdk.jol.info",
+      "org.openjdk.jol.layouters",
+      "org.openjdk.jol.util",
+      "org.openjdk.jol.vm",
+      "org.openjdk.jol.vm.sa"
+    ],
     "org.ow2.asm:asm": [
       "org.objectweb.asm",
       "org.objectweb.asm.signature"
@@ -4196,6 +4211,7 @@
       "org.objenesis:objenesis",
       "org.openjdk.jmh:jmh-core",
       "org.openjdk.jmh:jmh-generator-annprocess",
+      "org.openjdk.jol:jol-core",
       "org.ow2.asm:asm",
       "org.ow2.asm:asm-analysis",
       "org.ow2.asm:asm-commons",
