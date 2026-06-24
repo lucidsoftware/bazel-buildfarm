@@ -51,16 +51,10 @@ public class Worker {
   private boolean linkInputDirectories = true;
 
   /**
-   * @deprecated Ignored. The LinkedInputExclusions computation replaces regex patterns. To force
-   *     specific input directories to remain real rather than symlinked, use {@link
-   *     #linkedInputExclusionPatterns}.
+   * @deprecated Ignored; use {@link #linkedInputExclusionPatterns}.
    */
   @Deprecated private List<String> linkedInputDirectories = new ArrayList<>();
 
-  // Regex patterns matched against each input directory's path relative to the input root. A
-  // matching directory is kept as a real directory rather than symlinked to its CAS tree, merging
-  // with the auto-computed LinkedInputExclusions set. Empty by default. Replaces the operator
-  // control formerly provided by the (now-deprecated) inclusion-oriented linkedInputDirectories.
   private List<String> linkedInputExclusionPatterns = new ArrayList<>();
 
   private String execOwner;

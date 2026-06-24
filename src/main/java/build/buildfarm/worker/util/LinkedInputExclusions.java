@@ -16,21 +16,24 @@ package build.buildfarm.worker.util;
 
 import build.bazel.remote.execution.v2.Command;
 import com.google.common.collect.ImmutableSet;
+import io.prometheus.client.Counter;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.HashSet;
 import java.util.Set;
 
-/**
- * Computes the set of input directory paths excluded from directory-level linking. These paths must
- * remain real directories because they are ancestors of output paths or tool input paths. A
- * directory NOT in the returned set can be replaced with a single link to its CAS materialized
- * tree. A directory IN the set must be created as a real directory and descended into.
- *
- * <p>Shared between CFCLinkExecFileSystem (for exec dir creation) and ProtoCoordinator (for
- * persistent worker input linking).
- */
+/** Computes input directories that must remain real rather than linked to the CAS tree. */
 public final class LinkedInputExclusions {
+  // Count declarations rather than expanded ancestors.
+  private static final Counter linkedInputExclusionsTotal =
+      Counter.build()
+          .name("linked_input_exclusions_total")
+          .labelNames("reason")
+          .help(
+              "Directory-linking exclusions by source (output_path / output_file / "
+                  + "output_directory / tool_input / exclude_directory).")
+          .register();
+
   private LinkedInputExclusions() {}
 
   public static final class ExclusionSet {
@@ -94,8 +97,7 @@ public final class LinkedInputExclusions {
     if (path.indexOf('\0') != -1) {
       throw new IllegalArgumentException("LinkedInputExclusions path contains NUL: " + path);
     }
-    // Most paths from the REAPI Command are already normalized. Keep this normalization independent
-    // of the host filesystem so these sets always contain REAPI-style slash-separated paths.
+    // Keep normalization host-independent so paths always use REAPI separators.
     if (!needsNormalization(path)) {
       return path;
     }
@@ -142,7 +144,6 @@ public final class LinkedInputExclusions {
     return false;
   }
 
-  /** Adds all proper ancestor directory paths of the given path. The path itself is NOT added. */
   private static void addAncestors(String path, Set<String> ancestors) {
     int slashIndex = path.indexOf('/');
     while (slashIndex != -1) {
@@ -161,9 +162,7 @@ public final class LinkedInputExclusions {
         stripTrailingSlash(workingDirectory.isEmpty() ? path : workingDirectory + "/" + path));
   }
 
-  /**
-   * Returns {@code path} relative to {@code root}, using REAPI's '/' separator on every host OS.
-   */
+  /** Returns {@code path} relative to {@code root}, using REAPI separators. */
   public static String pathToRelativeString(Path root, Path path) {
     Path relative = root.relativize(path);
     if (relative.toString().isEmpty()) {
@@ -196,17 +195,15 @@ public final class LinkedInputExclusions {
     String workingDirectory = stripTrailingSlash(command.getWorkingDirectory());
 
     if (command.getOutputPathsCount() != 0) {
-      // REAPI >= 2.1: output_paths entries can be files OR directories — the type is not
-      // known here, so conservatively treat each path as a potential directory that must
-      // remain real and writable.
+      // output_paths may name files or directories, so treat each as a writable directory root.
       for (String outputPath : command.getOutputPathsList()) {
         String resolved = resolveAgainstWorkingDirectory(workingDirectory, outputPath);
         addPathAndAncestors(resolved, exclusions);
         recursiveExclusions.add(resolved);
+        linkedInputExclusionsTotal.labels("output_path").inc();
       }
     } else {
-      // REAPI < 2.1: for output_files only the parent directory + ancestors must remain
-      // real (the entry itself is a file, not a directory).
+      // output_files require only their parent directories to remain real.
       for (String outputFile : command.getOutputFilesList()) {
         String resolved = resolveAgainstWorkingDirectory(workingDirectory, outputFile);
         int lastSlash = resolved.lastIndexOf('/');
@@ -214,28 +211,28 @@ public final class LinkedInputExclusions {
           String parent = resolved.substring(0, lastSlash);
           exclusions.add(parent);
           addAncestors(parent, exclusions);
+          linkedInputExclusionsTotal.labels("output_file").inc();
         }
       }
       for (String outputDir : command.getOutputDirectoriesList()) {
         String resolved = resolveAgainstWorkingDirectory(workingDirectory, outputDir);
         addPathAndAncestors(resolved, exclusions);
         recursiveExclusions.add(resolved);
+        linkedInputExclusionsTotal.labels("output_directory").inc();
       }
     }
 
-    // Exclude paths are file paths (e.g., tool input files). Only their ancestor
-    // directories must remain real — the file path itself is never checked during
-    // directory traversal.
     for (String excludePath : excludePaths) {
       String normalized = normalizePath(stripTrailingSlash(excludePath));
       addAncestors(normalized, exclusions);
+      linkedInputExclusionsTotal.labels("tool_input").inc();
     }
 
-    // Exclude directories are directory paths. Their ancestors must also remain real so traversal
-    // can reach the matching directory instead of symlinking an ancestor first.
+    // Ancestors must remain real for traversal to reach the excluded directory.
     for (String excludeDirectory : excludeDirectories) {
       String normalized = normalizePath(stripTrailingSlash(excludeDirectory));
       addPathAndAncestors(normalized, exclusions);
+      linkedInputExclusionsTotal.labels("exclude_directory").inc();
     }
 
     return new ExclusionSet(

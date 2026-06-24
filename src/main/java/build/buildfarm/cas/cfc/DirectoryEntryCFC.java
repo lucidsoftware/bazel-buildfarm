@@ -35,7 +35,6 @@ import build.buildfarm.common.BuildfarmExecutors;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.ZstdDecompressingOutputStream.FixedBufferPool;
-import build.buildfarm.common.io.Directories;
 import build.buildfarm.common.io.Utils;
 import build.buildfarm.v1test.Digest;
 import com.google.common.annotations.VisibleForTesting;
@@ -80,20 +79,21 @@ import org.jspecify.annotations.Nullable;
 
 @Log
 public class DirectoryEntryCFC extends CASFileCache {
-  /** Bounds re-fetch retries per caller so a pathological repeated rename race cannot livelock. */
+  /** Maximum re-fetch attempts after a source rename race. */
   @VisibleForTesting static final int MAX_REFETCH_ATTEMPTS = 3;
 
-  // === Phase 3 metrics (lock-free Prometheus counters/gauge; not on the lock-free hot path).
-  //     cas_-prefixed to match the package's CAS-internal metrics (cas_copy_fallback, cas_size).
-  // ===
   private static final Counter hardlinkFallbackTotal =
       Counter.build()
           .name("cas_hardlink_fallback_total")
           .help("CAS-directory hardlinks that fell back to byte-copy.")
           .register();
-  // Incremented once per re-fetch attempt (not once per distinct race) — the name and help both say
-  // "attempts" so a single race that needs N tries adds N here, matching the loop in
-  // reFetchAndLink.
+  private static final Counter casDirectoryHardlinksTotal =
+      Counter.build()
+          .name("cas_directory_hardlinks_total")
+          .help(
+              "CAS-directory file hardlinks that succeeded (pairs with"
+                  + " cas_hardlink_fallback_total).")
+          .register();
   private static final Counter hardlinkRefetchAttemptsTotal =
       Counter.build()
           .name("cas_hardlink_race_refetch_attempts_total")
@@ -123,16 +123,9 @@ public class DirectoryEntryCFC extends CASFileCache {
 
   private final Cache<Digest, ListenableFuture<Void>> fetchers = CacheBuilder.newBuilder().build();
 
-  // Source-Entry lookup for the parent-directory eviction walker, which sees only a hardlinked
-  // file's inode (not its CAS key). Owns the inode -> Entry map and the casDirectoryHardlinkCount
-  // bookkeeping; see CasInodeIndex.
   private final CasInodeIndex casInodeIndex = new CasInodeIndex();
 
-  // Report the inode-index size at scrape time rather than writing the gauge on every hardlink
-  // create/delete — the latter would call ConcurrentHashMap.size() per file on the eviction-cleanup
-  // walk (thousands of files for a node_modules tree). Mirrors EvictorShard's heartbeat/park
-  // callback gauges: setChild on the shared static gauge is last-writer-wins across instances
-  // (production runs one CAS; tests never assert this gauge, so the replacement is benign there).
+  // Compute index size at scrape time to keep it off the hardlink path.
   {
     inodeMapEntriesGauge.setChild(
         new Gauge.Child() {
@@ -143,19 +136,11 @@ public class DirectoryEntryCFC extends CASFileCache {
         });
   }
 
-  // Singleflight for the rename-race re-fetch path: concurrent callers re-materializing the same
-  // evicted source digest piggyback on one in-flight put rather than each launching their own.
-  // Entries live only for the duration of an in-flight re-fetch (removed in the owner's finally),
-  // so no TTL is needed — a JVM crash drops the whole map anyway.
+  // Coalesces concurrent re-fetches of the same source.
   private final ConcurrentMap<String, ListenableFuture<PathResult>> sourceFileRefetchers =
       new ConcurrentHashMap<>();
 
-  /**
-   * Indirection over the hardlink syscall so tests can inject {@code ENOLINK}-class failures and
-   * rename-race {@code NoSuchFileException}s without needing 65k real links or a live evictor race.
-   * {@code link(source, destination)} makes {@code destination} a hardlink to {@code source}'s
-   * inode.
-   */
+  /** Hardlink operation, replaceable by tests. */
   @FunctionalInterface
   interface FileLinker {
     void link(Path source, Path destination) throws IOException;
@@ -166,8 +151,6 @@ public class DirectoryEntryCFC extends CASFileCache {
     @Nullable Object fileKey(Path source) throws IOException;
   }
 
-  // Files.createLink(link, existing) takes the new link first; our link(source, destination) names
-  // the existing source first, so the default flips the argument order.
   private volatile FileLinker fileLinker =
       (source, destination) -> Files.createLink(destination, source);
 
@@ -303,9 +286,6 @@ public class DirectoryEntryCFC extends CASFileCache {
 
   private void computeDirectory(
       Path path, Map<Object, Entry> fileKeys, ImmutableList.Builder<Path> invalidDirectories) {
-    // computeDirectory reconstructs CAS-directory-hardlink pins by looking up source Entries by
-    // inode, so the standalone file scan must have fully admitted those Entries first (Phase 3
-    // invariant 8). Always-on check (codebase convention favors Preconditions over -ea asserts).
     checkState(standaloneScanComplete, "computeDirectory ran before the standalone scan completed");
     String key = path.getFileName().toString();
     List<PendingCasDirectoryHardlink> pendingHardlinks = new ArrayList<>();
@@ -317,9 +297,7 @@ public class DirectoryEntryCFC extends CASFileCache {
           new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-              // Directories are never hardlinked into the CAS (POSIX forbids link() on directories;
-              // a directory's nlink > 1 comes from its subdirectories' ".." entries). Their inode
-              // blocks are always charged in full.
+              // Directory link counts include child ".." entries, not CAS hardlinks.
               blobSizeInBytes.addAndGet(
                   estimateSizeOnDisk(attrs.size(), blockSize, /* isHardlink= */ false));
               return FileVisitResult.CONTINUE;
@@ -390,15 +368,7 @@ public class DirectoryEntryCFC extends CASFileCache {
     return invalidDirectories.build();
   }
 
-  /**
-   * Returns the startup byte charge for a regular file in an existing on-disk {@code _dir} tree.
-   *
-   * <p>A hardlink can be charged as zero bytes only when the scan can prove which standalone CAS
-   * Entry already accounts for that inode and can apply a matching pin after the directory is
-   * admitted. If no indexed source exists (for example a snapshot-fast-path source admitted without
-   * a stat), charge one copy of the unindexed hardlinked inode to the directory tree so eviction of
-   * the standalone path cannot leave unaccounted blocks behind.
-   */
+  /** Returns the startup charge for a file, avoiding double-charge for indexed hardlinks. */
   private long startupDirectoryFileSize(
       Path file,
       BasicFileAttributes attrs,
@@ -430,11 +400,7 @@ public class DirectoryEntryCFC extends CASFileCache {
     return estimateSizeOnDisk(attrs.size(), blockSize, /* isHardlink= */ true);
   }
 
-  /**
-   * Reads {@code unix:nlink} for {@code path}, returning 1 when the attribute is unavailable (no
-   * unix view, or any I/O error). Defaulting to 1 is the safe choice: it treats the file as a fresh
-   * inode, so the size estimate charges full blocks and no CAS-directory-hardlink pin is recorded.
-   */
+  /** Reads {@code unix:nlink}, defaulting to one so unknown files are fully charged. */
   private static int readNlink(Path path) {
     try {
       Object nlink = Files.getAttribute(path, "unix:nlink");
@@ -442,7 +408,7 @@ public class DirectoryEntryCFC extends CASFileCache {
         return count.intValue();
       }
     } catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
-      // unix view unavailable on this filesystem; fall through to the safe default.
+      // Use the safe default on filesystems without Unix attributes.
     }
     return 1;
   }
@@ -463,17 +429,7 @@ public class DirectoryEntryCFC extends CASFileCache {
     removeCasDirectoryTree(path);
   }
 
-  /**
-   * Deletes a CAS-internal {@code _dir} tree, decrementing each hardlinked file's source {@code
-   * casDirectoryHardlinkCount} so the source becomes evictable once its last referencing directory
-   * is gone. Mirrors {@link Directories#remove} but adds the CAS bookkeeping inline — generic
-   * {@code Directories.remove} is called from non-CAS contexts and must stay bookkeeping-free.
-   *
-   * <p>Order is delete-then-decrement per file: {@link Files#delete} is the realistic failure point
-   * (permissions, I/O), so doing it first means a delete failure leaves refcounts untouched and the
-   * system consistent. A file with no indexed source (copy-fallback, re-fetch-fallback, or a
-   * fast-path source not indexed at startup) is simply deleted with no decrement.
-   */
+  /** Deletes a CAS directory tree and releases its source-entry hardlink pins. */
   private void removeCasDirectoryTree(Path directory) throws IOException {
     Files.walkFileTree(
         directory,
@@ -488,21 +444,14 @@ public class DirectoryEntryCFC extends CASFileCache {
           @Override
           public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
               throws IOException {
-            // Capture the inode before deletion (attrs is populated pre-delete by walkFileTree).
-            // Normalize to match the keys recorded at link/startup time.
+            // Capture the inode before deletion.
             Object fileKey = Utils.toInodeKey(attrs);
-            // we will *NOT* delete the file on windows if it is still open
+            // Windows cannot delete an open file.
             Files.delete(file);
             if (fileKey != null) {
               Entry sourceEntry = casInodeIndex.get(fileKey);
               if (sourceEntry != null && casInodeIndex.decrement(sourceEntry, fileKey) == 0) {
-                // This decrement removed the source's last CAS-directory hardlink, so it may now
-                // be evictable. Wake its shard's evictor: the source stays linked on the LRU (the
-                // sweep skipped it without unlinking), so a re-sweep reclaims it. Without the wake,
-                // an evictor parked stuckAboveLow waits for a charge/release the async detach path
-                // never issues. Keying off decrement's returned count rather than a separate
-                // re-read of casDirectoryHardlinkCount closes a last-decrementer race that could
-                // otherwise leave the source un-woken until the idle heartbeat.
+                // The final released pin makes the source evictable.
                 casShards.requestEvictionSweep(sourceEntry.key);
               }
             }
@@ -528,39 +477,18 @@ public class DirectoryEntryCFC extends CASFileCache {
         Files.deleteIfExists(path);
       }
     } catch (NoSuchFileException e) {
-      // Already gone.
     }
   }
 
   /**
-   * Materializes {@code src}'s content at {@code dst} via hardlink (with copy and re-fetch
-   * fallbacks), and <em>transfers</em> the source's reference from the caller's transient {@code
-   * referenceCount} hold to a persistent {@code casDirectoryHardlinkCount} hold owned by the parent
-   * directory tree.
+   * Materializes {@code src} at {@code dst}, preferring a tracked hardlink and falling back to
+   * re-fetch or copy.
    *
-   * <p>Net effect on src's Entry on the happy path: {@code referenceCount -= 1}, {@code
-   * casDirectoryHardlinkCount += 1}. Total references are unchanged; the reference's lifetime now
-   * matches the parent directory's, not the caller's.
-   *
-   * <p>The copy fallback (FileSystemException, unsupported hardlinks, or missing inode key &rarr;
-   * byte-copy) does not record a {@code casDirectoryHardlinkCount} hold, because that copy lands on
-   * a fresh inode independent of any CAS entry. The re-fetch fallback (NoSuchFileException) records
-   * one when the retry hardlinks successfully: it re-materializes the source as a CAS entry and
-   * hardlinks {@code dst} to it, exactly like the happy path (the bookkeeping happens inside {@link
-   * #singleflightReFetchAndLink}). The caller's transient hold on src is released in the finally
-   * regardless.
-   *
-   * @return {@code true} if {@code dst} was materialized as a hardlink (happy path or re-fetch), so
-   *     it shares the source inode's already-charged blocks; {@code false} if it fell back to a
-   *     byte-copy onto a fresh inode. The caller charges on-disk bytes accordingly — a copy
-   *     consumes real blocks and must not be charged as a zero-block hardlink.
+   * @return whether {@code dst} shares an already-charged inode
    */
   private boolean linkAndReference(Path dst, Path src, Digest srcDigest, boolean isExecutable)
       throws IOException, InterruptedException {
     try {
-      // recordHere drives the bottom-of-method increment for the happy path only; the re-fetch
-      // fallback records against the re-materialized source itself inside
-      // singleflightReFetchAndLink.
       HardlinkSource recordHere = null;
       boolean copyFallback = false;
       boolean materializedAsHardlink;
@@ -578,9 +506,7 @@ public class DirectoryEntryCFC extends CASFileCache {
         if (!linkFailureMayBeMissingSource(e, src)) {
           throw e;
         }
-        // A Phase-2.1 evictor rename-to-_removed fired between our refCount bump and the link.
-        // Theoretically unreachable under refcount discipline (Phase 2 invariant 1), but rather
-        // than fail the action we re-materialize the source via the CAS and retry the link.
+        // Recover if the source was renamed between reference acquisition and link creation.
         log.log(
             Level.WARNING,
             "linkAndReference: source "
@@ -590,32 +516,17 @@ public class DirectoryEntryCFC extends CASFileCache {
             e);
         materializedAsHardlink = reFetchAndLink(srcDigest, isExecutable, dst);
       } catch (AccessDeniedException | FileAlreadyExistsException e) {
-        // Not a link-capability limit: a permission misconfiguration or an unexpectedly-present
-        // dst. Both ends are CAS-owned, so fail loud rather than silently masking the fault as a
-        // byte-copy (which REPLACE_EXISTING below would also clobber a pre-existing dst).
+        // Do not mask permission errors or an unexpectedly existing destination.
         throw e;
       } catch (FileSystemException | UnsupportedOperationException e) {
-        // EMLINK (ext4's ~65k-link limit) or EXDEV (cross-device) — neither has a dedicated NIO
-        // subclass, so they surface as the residual FileSystemException; exception-class match, not
-        // message match. Providers can also report unsupported hardlinks via the optional-operation
-        // UnsupportedOperationException path. The copy lands on a fresh inode consuming real
-        // blocks,
-        // so it records no hardlink pin and the caller charges its real blocks rather than treating
-        // it as a hardlink.
+        // EMLINK, EXDEV, and unsupported hardlinks fall back to a separately charged copy.
         copyFallback = true;
         materializedAsHardlink = false;
       }
       if (copyFallback) {
         copyHardlinkFallback(src, dst);
       }
-      // Account a real hardlink to src's inode, then set perms. Recording before setReadOnlyPerms
-      // establishes the persistent pin before the realistic post-link failure point: if perms were
-      // set first and threw, the finally would release src's last transient referenceCount while a
-      // hardlink to its inode still exists on disk — a transient unpinned-but-hardlinked window the
-      // byte accounting otherwise rules out. This matches the re-fetch fallback, which records
-      // inside singleflightReFetchAndLink before perms are set here (recordHere is null on that
-      // path). Both calls are outside the link try/catch so a failure here cannot re-trigger the
-      // link-fallback against an already-created dst.
+      // Pin the inode before permission changes can fail and release the transient reference.
       if (recordHere != null) {
         recordCasDirectoryHardlink(recordHere);
       }
@@ -626,21 +537,10 @@ public class DirectoryEntryCFC extends CASFileCache {
     }
   }
 
-  /**
-   * Returns the source Entry and inode key needed to record a CAS-directory hardlink. The caller
-   * still holds src's {@code referenceCount}, so the source Entry is present and pinned for the
-   * duration of this call.
-   *
-   * <p>A null {@code fileKey} means this filesystem/provider can create hardlinks but cannot expose
-   * an inode identity. Runtime handles that the same way startup reconstruction does for unindexed
-   * hardlinks: fall back to a byte-copy and charge the directory file's blocks rather than create
-   * an untracked hardlink.
-   */
+  /** Returns the source entry and inode key needed to track a hardlink, or null to force a copy. */
   private @Nullable HardlinkSource hardlinkSourceOrNull(Path src) throws IOException {
     Entry sourceEntry = storage.get(src.getFileName().toString());
     if (sourceEntry == null) {
-      // Theoretically unreachable while the caller holds src's refcount; fall back to a byte-copy
-      // rather than create an untracked hardlink.
       log.log(
           Level.WARNING,
           "linkAndReference: no source entry for "
@@ -663,6 +563,7 @@ public class DirectoryEntryCFC extends CASFileCache {
 
   private void recordCasDirectoryHardlink(HardlinkSource source) {
     casInodeIndex.increment(source.sourceEntry(), source.fileKey());
+    casDirectoryHardlinksTotal.inc();
   }
 
   private void copyHardlinkFallback(Path src, Path dst) throws IOException {
@@ -670,11 +571,7 @@ public class DirectoryEntryCFC extends CASFileCache {
     hardlinkFallbackTotal.inc();
   }
 
-  /**
-   * Re-materializes an evicted source and links it into {@code dst}, retrying a bounded number of
-   * times if the freshly-put source races away again before we can hold it. Concurrent callers for
-   * the same digest singleflight on one in-flight put.
-   */
+  /** Re-fetches and links an evicted source, coalescing concurrent fetches by digest. */
   private boolean reFetchAndLink(Digest srcDigest, boolean isExecutable, Path dst)
       throws IOException, InterruptedException {
     String srcKey = getKey(srcDigest, isExecutable);
@@ -690,7 +587,6 @@ public class DirectoryEntryCFC extends CASFileCache {
           hardlinkRaceExhaustedTotal.inc();
           throw e;
         }
-        // Fresh source raced away before we could hold it; re-materialize and try again.
       }
     }
   }
@@ -702,8 +598,7 @@ public class DirectoryEntryCFC extends CASFileCache {
     ListenableFuture<PathResult> existing = sourceFileRefetchers.putIfAbsent(srcKey, mine);
     PathResult fresh;
     if (existing == null) {
-      // We own the re-fetch. put() runs synchronously on this thread and holds one reference on the
-      // fresh source, which we release in the link finally below.
+      // put() returns with one reference held for this owner.
       try {
         fresh = put(srcDigest, isExecutable);
         mine.set(fresh);
@@ -714,12 +609,10 @@ public class DirectoryEntryCFC extends CASFileCache {
         sourceFileRefetchers.remove(srcKey, mine);
       }
     } else {
-      // A peer is (or just was) re-fetching the same source. Wait for its result, then take our own
-      // reference — the owner's put incremented refCount only once.
+      // Followers must acquire their own reference after the shared fetch completes.
       hardlinkRaceSingleflightFollowersTotal.inc();
       fresh = getInterruptiblyOrIOException(existing);
       if (!referenceIfExists(srcKey)) {
-        // The fresh source was evicted again before we could hold it. Signal the retry loop.
         throw new NoSuchFileException(srcKey);
       }
     }
@@ -728,13 +621,6 @@ public class DirectoryEntryCFC extends CASFileCache {
         HardlinkSource source = hardlinkSourceOrNull(fresh.path());
         if (source != null) {
           fileLinker.link(fresh.path(), dst);
-          // The re-fetched dst is a hardlink to the re-materialized source's inode (a CAS entry),
-          // so
-          // pin it exactly like the happy path. We still hold a reference on srcKey here (owner via
-          // put, follower via referenceIfExists), so the source Entry is present for the increment.
-          // Without this the source would be left unpinned and could be evicted while this _dir
-          // tree
-          // still references its inode, leaking its blocks from the byte accounting.
           recordCasDirectoryHardlink(source);
           return true;
         }
@@ -743,7 +629,6 @@ public class DirectoryEntryCFC extends CASFileCache {
       } catch (AccessDeniedException | FileAlreadyExistsException e) {
         throw e;
       } catch (FileSystemException | UnsupportedOperationException e) {
-        // Fall through to the byte-copy fallback below.
       }
       copyHardlinkFallback(fresh.path(), dst);
       return false;
@@ -827,13 +712,6 @@ public class DirectoryEntryCFC extends CASFileCache {
                   estimateSizeOnDisk(blobSizeInBytes, blockSize, /* isHardlink= */ false);
               AtomicBoolean charged = new AtomicBoolean();
 
-              // might be able to clean this call up, need the expiration, but not the boolean
-              // consider the file size being too large for the cas
-              // consider just calling a safe 'charge' during the enumeration of the size
-              // ... since we're consuming the size anyway, but then we have to worry about rolling
-              // the partial charge back
-              // ... or we just compute early and charge then, though we run the risk of evicting
-              // useful blobs for this fetch
               try {
                 checkState(charge(key, blobSizeInBytes, charged), true);
                 Entry e = new Entry(key, blobSizeInBytes, Deadline.after(10, HOURS));
@@ -867,12 +745,7 @@ public class DirectoryEntryCFC extends CASFileCache {
               return immediateFailedFuture(e);
             },
             service);
-    // Invalidate the fetcher entry on terminal completion (success OR failure) rather than only on
-    // the success path. Invalidating only on success leaves a failed future cached, poisoning every
-    // subsequent putDirectory(digest) for the cache's lifetime. The listener fires after the future
-    // terminally completes, and concurrent followers share this same future instance, so they
-    // observe its outcome before any post-invalidation caller starts a fresh fetch — the
-    // singleflight contract is preserved.
+    // Do not retain a failed fetch and poison later requests for the same digest.
     stored.addListener(() -> fetchers.invalidate(digest), directExecutor());
     return stored;
   }
@@ -892,11 +765,7 @@ public class DirectoryEntryCFC extends CASFileCache {
               directoriesIndex,
               (dst, src, srcDigest, size, isExecutable) -> {
                 boolean hardlinked = linkAndReference(dst, src, srcDigest, isExecutable);
-                // A hardlink shares the already-charged standalone CAS inode, so it adds no new
-                // on-disk blocks (only the directory overhead, dirOverhead below, is charged). A
-                // copy-fallback (hardlinked == false) lands on a fresh inode and must be charged
-                // its
-                // real blocks, or the cache under-counts and overshoots its byte budget.
+                // Only copy fallback creates new file blocks.
                 weight.addAndGet(estimateSizeOnDisk(size, blockSize, /* isHardlink= */ hardlinked));
               },
               putFuturesBuilder,
@@ -950,11 +819,9 @@ public class DirectoryEntryCFC extends CASFileCache {
       if (putPath == null) {
         try {
           putFutures.get(i).get();
-          // should never get here
         } catch (ExecutionException e) {
           failures.add(e.getCause());
         } catch (Throwable t) {
-          // cancelled or interrupted during get
           failures.add(t);
         }
       }

@@ -43,6 +43,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.ListenableFuture;
+import io.prometheus.client.Counter;
 import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
@@ -69,13 +70,22 @@ import org.jspecify.annotations.Nullable;
 
 @Log
 public class CFCLinkExecFileSystem extends CFCExecFileSystem {
+  private static final Counter execDirDirectoriesSymlinkedTotal =
+      Counter.build()
+          .name("exec_dir_directories_symlinked_total")
+          .help("Input directories materialized as a single directory symlink (the cheap path).")
+          .register();
+  private static final Counter execDirDirectoriesHardlinkedFallbackTotal =
+      Counter.build()
+          .name("exec_dir_directories_hardlinked_fallback_total")
+          .help(
+              "Link-candidate input directories excluded from directory symlinking, descended as "
+                  + "real directories and materialized via per-file hardlinking.")
+          .register();
+
   // perform first-available non-output symlinking and retain directories in cache
   private final boolean linkInputDirectories;
 
-  // operator-supplied regex patterns; any input directory whose path-relative-to-the-input-root
-  // matches is kept as a real directory rather than symlinked to its CAS tree. These merge with the
-  // auto-computed LinkedInputExclusions set — a directory is excluded from linking if it appears in
-  // the computed set OR matches one of these patterns.
   private final ImmutableList<Pattern> linkedInputExclusionPatterns;
 
   private final Map<Path, DigestFunction.Value> rootInputDigestFunction = new ConcurrentHashMap<>();
@@ -318,9 +328,10 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
             parentOutputDirectory != null ? parentOutputDirectory.getChild(name) : null;
       }
       String relativePath = LinkedInputExclusions.pathToRelativeString(root, dir);
-      if (linkInputDirectories
-          && outputDirectory == null
-          && !linkedInputExclusions.excludes(relativePath)) {
+      boolean linkCandidate = linkInputDirectories && outputDirectory == null;
+      boolean excluded = linkCandidate && linkedInputExclusions.excludes(relativePath);
+      if (linkCandidate && !excluded) {
+        execDirDirectoriesSymlinkedTotal.inc();
         Digest digest = (Digest) attrs.fileKey();
         build.bazel.remote.execution.v2.Digest reapiDigest = DigestUtil.toDigest(digest);
         workerExecutedMetadata.addLinkedInputDirectories(relativePath);
@@ -336,6 +347,9 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
                 },
                 fetchService));
         return FileVisitResult.SKIP_SUBTREE;
+      }
+      if (excluded) {
+        execDirDirectoriesHardlinkedFallbackTotal.inc();
       }
 
       FileVisitResult result = super.preVisitDirectory(dir, attrs);

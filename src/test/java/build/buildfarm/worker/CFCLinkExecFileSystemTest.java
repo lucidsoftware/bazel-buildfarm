@@ -130,7 +130,7 @@ public class CFCLinkExecFileSystemTest {
             fileCache,
             ImmutableMap.of(),
             /* linkInputDirectories= */ true,
-            ImmutableList.of(), // deprecated — LinkedInputExclusions replaces regex patterns
+            ImmutableList.of(),
             /* linkedInputExclusionPatterns= */ ImmutableList.of(),
             /* allowSymlinkTargetAbsolute= */ false,
             service,
@@ -175,12 +175,6 @@ public class CFCLinkExecFileSystemTest {
         WorkerExecutedMetadata.newBuilder());
   }
 
-  /**
-   * Builds a standalone {@link CFCLinkExecFileSystem} backed by its own {@link DirectoryEntryCFC},
-   * rooted under unique {@code cache-<name>} / {@code exec-<name>} directories. Used by tests that
-   * need a configuration the shared {@code @Before} fixture doesn't provide (a different {@code
-   * linkInputDirectories} flag or non-empty exclusion patterns).
-   */
   private CFCLinkExecFileSystem newLinkExecFileSystem(
       String name, boolean linkInputDirectories, ImmutableList<String> linkedInputExclusionPatterns)
       throws Exception {
@@ -233,11 +227,6 @@ public class CFCLinkExecFileSystemTest {
     return fileSystem;
   }
 
-  /**
-   * Verifies that directories listed in output_paths are not symlinked to the read-only CAS cache.
-   * Output path ancestors are in the linkedInputExclusions set, so they must be created as real
-   * writable directories.
-   */
   @Test
   public void outputPathDirectoryIsNotSymlinked() throws Exception {
     Directory rootDir =
@@ -264,12 +253,6 @@ public class CFCLinkExecFileSystemTest {
     }
   }
 
-  /**
-   * Verifies that a declared {@code output_paths} directory keeps existing descendants as real
-   * directories too. The server does not know whether an {@code output_paths} entry is a file or
-   * directory before execution, so the path must be treated as a recursive writable root while
-   * creating the exec tree.
-   */
   @Test
   public void outputPathDirectoryDescendantsAreNotSymlinked() throws Exception {
     Directory outDir =
@@ -426,15 +409,10 @@ public class CFCLinkExecFileSystemTest {
     }
   }
 
-  // --- linkedInputExclusions unit tests ---
-
   @Test
   public void linkedInputExclusions_fromOutputPaths() {
     Command command = Command.newBuilder().addOutputPaths("a/b/c/output.jar").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // output_paths includes the path itself ("a/b/c/output.jar") because under REAPI >= 2.1
-    // output_paths entries can be files OR directories — we don't know the type, so we
-    // conservatively treat each as a potential directory that must remain real.
     assertThat(result).containsExactly("a", "a/b", "a/b/c", "a/b/c/output.jar");
   }
 
@@ -442,7 +420,6 @@ public class CFCLinkExecFileSystemTest {
   public void linkedInputExclusions_fromOutputFiles() {
     Command command = Command.newBuilder().addOutputFiles("a/b/c/output.jar").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // For output_files, add parent dir + ancestors (not the file itself)
     assertThat(result).containsExactly("a", "a/b", "a/b/c");
   }
 
@@ -450,7 +427,6 @@ public class CFCLinkExecFileSystemTest {
   public void linkedInputExclusions_fromOutputDirectories() {
     Command command = Command.newBuilder().addOutputDirectories("a/b/outdir").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // For output_directories, add the directory itself + ancestors
     assertThat(result).containsExactly("a", "a/b", "a/b/outdir");
   }
 
@@ -478,7 +454,6 @@ public class CFCLinkExecFileSystemTest {
   public void linkedInputExclusions_rootLevelOutput() {
     Command command = Command.newBuilder().addOutputFiles("output.jar").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // Root-level file has no parent directory to add
     assertThat(result).isEmpty();
   }
 
@@ -494,7 +469,6 @@ public class CFCLinkExecFileSystemTest {
     Command command =
         Command.newBuilder().setWorkingDirectory("build").addOutputFiles("out/output.jar").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // Parent of build/out/output.jar is build/out, ancestors are build
     assertThat(result).containsExactly("build", "build/out");
   }
 
@@ -508,7 +482,6 @@ public class CFCLinkExecFileSystemTest {
 
   @Test
   public void linkedInputExclusions_rootLevelOutputPath() {
-    // Single-component output_path — the path itself is added but has no ancestors
     Command command = Command.newBuilder().addOutputPaths("outdir").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
     assertThat(result).containsExactly("outdir");
@@ -535,14 +508,11 @@ public class CFCLinkExecFileSystemTest {
             .addOutputDirectories("a/c/classes")
             .build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // output_files: parent a/b + ancestor a
-    // output_directories: a/c/classes itself + ancestors a/c, a
     assertThat(result).containsExactly("a", "a/b", "a/c", "a/c/classes");
   }
 
   @Test
   public void linkedInputExclusions_outputPathsShortCircuitOutputFilesAndDirectories() {
-    // REAPI >= 2.1: when output_paths is present, output_files and output_directories are ignored.
     Command command =
         Command.newBuilder()
             .addOutputPaths("a/out.jar")
@@ -550,7 +520,6 @@ public class CFCLinkExecFileSystemTest {
             .addOutputDirectories("ignored/dir")
             .build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // Only the output_paths entry and its ancestor contribute; the ignored/* entries do not.
     assertThat(result).containsExactly("a", "a/out.jar");
   }
 
@@ -559,15 +528,11 @@ public class CFCLinkExecFileSystemTest {
     Command command = Command.newBuilder().addOutputPaths("out/output.jar").build();
     ImmutableSet<String> result =
         LinkedInputExclusions.compute(command, ImmutableSet.of("tools/bin/javac", "libs/dep.jar"));
-    // Output ancestors + exclude path ancestors (exclude paths are files, not directories,
-    // so only their ancestors are added — the file path itself is irrelevant to directory linking)
     assertThat(result).containsExactly("out", "out/output.jar", "tools", "tools/bin", "libs");
   }
 
   @Test
   public void linkedInputExclusions_excludePathsAddOnlyAncestors() {
-    // Exclude paths are file paths (tool inputs). Only their ancestor directories need
-    // to remain real — the file path itself is never checked during directory traversal.
     Command command = Command.getDefaultInstance();
     ImmutableSet<String> result =
         LinkedInputExclusions.compute(command, ImmutableSet.of("tools/compiler"));
@@ -579,9 +544,6 @@ public class CFCLinkExecFileSystemTest {
     Command command = Command.newBuilder().addOutputPaths("out/output.jar/").build();
     ImmutableSet<String> result =
         LinkedInputExclusions.compute(command, ImmutableSet.of("tools/bin/"));
-    // Trailing slashes stripped — paths should be clean.
-    // "tools/bin/" is a file exclude path (trailing slash stripped to "tools/bin"),
-    // so only its ancestor "tools" is added.
     assertThat(result).containsExactly("out", "out/output.jar", "tools");
   }
 
@@ -590,7 +552,6 @@ public class CFCLinkExecFileSystemTest {
     Command command =
         Command.newBuilder().setWorkingDirectory("build/").addOutputPaths("out/output.jar").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // Trailing slash on workDir should be stripped — no double-slash paths
     assertThat(result).containsExactly("build", "build/out", "build/out/output.jar");
   }
 
@@ -598,7 +559,6 @@ public class CFCLinkExecFileSystemTest {
   public void linkedInputExclusions_dotDotSegmentsNormalized() {
     Command command = Command.newBuilder().addOutputPaths("a/b/../c/output.jar").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // "a/b/../c/output.jar" normalizes to "a/c/output.jar"
     assertThat(result).containsExactly("a", "a/c", "a/c/output.jar");
   }
 
@@ -617,7 +577,6 @@ public class CFCLinkExecFileSystemTest {
   public void linkedInputExclusions_dotSegmentsNormalized() {
     Command command = Command.newBuilder().addOutputFiles("a/./b/output.jar").build();
     ImmutableSet<String> result = LinkedInputExclusions.compute(command, ImmutableSet.of());
-    // "a/./b/output.jar" normalizes to "a/b/output.jar"; parent is "a/b"
     assertThat(result).containsExactly("a", "a/b");
   }
 
@@ -626,21 +585,14 @@ public class CFCLinkExecFileSystemTest {
     Command command = Command.getDefaultInstance();
     ImmutableSet<String> result =
         LinkedInputExclusions.compute(command, ImmutableSet.of("tools/./bin/../bin/javac"));
-    // "tools/./bin/../bin/javac" normalizes to "tools/bin/javac"; ancestors are "tools",
-    // "tools/bin"
     assertThat(result).containsExactly("tools", "tools/bin");
   }
 
   @Test
   public void linkedInputExclusions_overlappingExcludePathsAndOutputPaths() {
-    // Output at a/b/out.jar and tool input at a/c/javac share ancestor "a".
-    // Verify that set deduplication produces the correct merged result.
     Command command = Command.newBuilder().addOutputPaths("a/b/out.jar").build();
     ImmutableSet<String> result =
         LinkedInputExclusions.compute(command, ImmutableSet.of("a/c/javac"));
-    // "a" appears from both output ancestors and exclude ancestors — deduplicated.
-    // Output: a, a/b, a/b/out.jar (conservative — output_paths path itself included)
-    // Exclude: a, a/c (ancestors of a/c/javac)
     assertThat(result).containsExactly("a", "a/b", "a/b/out.jar", "a/c");
   }
 
@@ -684,13 +636,8 @@ public class CFCLinkExecFileSystemTest {
     assertThat(Files.exists(execFileSystem.root().resolve(operationName))).isFalse();
   }
 
-  // --- linkedInputExclusions tree walk integration tests ---
-
   @Test
   public void linkedInputExclusions_symlinksAtShallowDepthWhenOutputIsDeep() throws Exception {
-    // Build tree: root -> a -> b -> {src (with file), out (with file)}
-    // Output is at a/b/out/output.jar
-    // linkedInputExclusions = {a, a/b, a/b/out} — so a/b/src should be symlinked
     Directory emptyDir = Directory.getDefaultInstance();
     Digest emptyDirDigest = DIGEST_UTIL.compute(emptyDir);
 
@@ -751,17 +698,14 @@ public class CFCLinkExecFileSystemTest {
             WorkerExecutedMetadata.newBuilder());
 
     try {
-      // a, a/b are in linkedInputExclusions — real dirs
       assertThat(Files.isDirectory(execDir.resolve("a"))).isTrue();
       assertThat(Files.isSymbolicLink(execDir.resolve("a"))).isFalse();
       assertThat(Files.isDirectory(execDir.resolve("a/b"))).isTrue();
       assertThat(Files.isSymbolicLink(execDir.resolve("a/b"))).isFalse();
 
-      // a/b/src is NOT in linkedInputExclusions — should be symlinked
       assertThat(Files.exists(execDir.resolve("a/b/src"))).isTrue();
       assertThat(Files.isSymbolicLink(execDir.resolve("a/b/src"))).isTrue();
 
-      // a/b/out is in linkedInputExclusions — should be real dir
       assertThat(Files.isDirectory(execDir.resolve("a/b/out"))).isTrue();
       assertThat(Files.isSymbolicLink(execDir.resolve("a/b/out"))).isFalse();
     } finally {
@@ -771,7 +715,6 @@ public class CFCLinkExecFileSystemTest {
 
   @Test
   public void linkedInputExclusions_rootLevelDirectoryWithNoOutputs() throws Exception {
-    // A first-level directory with no outputs anywhere should be symlinked at root level
     Directory emptyDir = Directory.getDefaultInstance();
     Digest emptyDirDigest = DIGEST_UTIL.compute(emptyDir);
 
@@ -790,7 +733,6 @@ public class CFCLinkExecFileSystemTest {
             DigestUtil.toDigest(rootDirDigest), rootDir,
             DigestUtil.toDigest(emptyDirDigest), emptyDir);
 
-    // Output at a different path — src/ is completely safe to symlink
     Command command = Command.newBuilder().addOutputPaths("build/output.jar").build();
     Action action =
         Action.newBuilder().setInputRootDigest(DigestUtil.toDigest(rootDirDigest)).build();
@@ -838,7 +780,6 @@ public class CFCLinkExecFileSystemTest {
             DigestUtil.toDigest(rootDirDigest), rootDir,
             DigestUtil.toDigest(emptyDirDigest), emptyDir);
 
-    // No outputs — everything should be symlinked
     Command command = Command.getDefaultInstance();
     Action action =
         Action.newBuilder().setInputRootDigest(DigestUtil.toDigest(rootDirDigest)).build();
@@ -863,8 +804,6 @@ public class CFCLinkExecFileSystemTest {
 
   @Test
   public void linkedInputExclusions_withLinkInputDirectoriesDisabled() throws Exception {
-    // With linkInputDirectories=false, input directories are materialized as real directories
-    // rather than symlinked, regardless of the exclusion computation.
     CFCLinkExecFileSystem noLinkFs =
         newLinkExecFileSystem(
             "nolink", /* linkInputDirectories= */ false, /* patterns= */ ImmutableList.of());
@@ -901,7 +840,6 @@ public class CFCLinkExecFileSystemTest {
             WorkerExecutedMetadata.newBuilder());
 
     try {
-      // With linkInputDirectories=false, directories should NOT be symlinked
       assertThat(Files.isDirectory(execDir.resolve("src"))).isTrue();
       assertThat(Files.isSymbolicLink(execDir.resolve("src"))).isFalse();
     } finally {
@@ -912,11 +850,6 @@ public class CFCLinkExecFileSystemTest {
   @Test
   public void linkedInputExclusionPatterns_keepMatchingTopLevelDirectoryRealAnchored()
       throws Exception {
-    // Operator-supplied exclusion patterns merge with the auto-computed exclusion set: a directory
-    // matching a pattern is kept real even when no output forces it to be. This reproduces the
-    // migration story for the old inclusion regex "^(?!external$).*$" — rewriting it as the
-    // exclusion pattern "external" keeps the external/ tree from being symlinked. The pattern is a
-    // full-string (anchored) match, so a sibling "externalfoo" is NOT kept real.
     CFCLinkExecFileSystem patternFs =
         newLinkExecFileSystem(
             "anchored", /* linkInputDirectories= */ true, ImmutableList.of("external"));
@@ -948,7 +881,6 @@ public class CFCLinkExecFileSystemTest {
             DigestUtil.toDigest(rootDirDigest), rootDir,
             DigestUtil.toDigest(emptyDirDigest), emptyDir);
 
-    // No outputs touch any directory, so without the pattern all three would be symlinked.
     Command command = Command.getDefaultInstance();
     Action action =
         Action.newBuilder().setInputRootDigest(DigestUtil.toDigest(rootDirDigest)).build();
@@ -964,14 +896,11 @@ public class CFCLinkExecFileSystemTest {
             WorkerExecutedMetadata.newBuilder());
 
     try {
-      // external matches the exclusion pattern exactly — kept as a real directory.
       assertThat(Files.isDirectory(execDir.resolve("external"))).isTrue();
       assertThat(Files.isSymbolicLink(execDir.resolve("external"))).isFalse();
 
-      // externalfoo is not a full-string match for "external" — symlinked (proves anchoring).
       assertThat(Files.isSymbolicLink(execDir.resolve("externalfoo"))).isTrue();
 
-      // src matches no pattern and no output — symlinked to its CAS tree.
       assertThat(Files.isSymbolicLink(execDir.resolve("src"))).isTrue();
     } finally {
       patternFs.destroyExecDir(execDir);
@@ -981,10 +910,6 @@ public class CFCLinkExecFileSystemTest {
   @Test
   public void linkedInputExclusionPatterns_keepNestedDirectoryRealAlongsideOutputAncestors()
       throws Exception {
-    // A pattern is matched against each directory's path relative to the input root, so it can keep
-    // a deep directory real. Here the output path forces a and a/b real via the auto-computed set,
-    // the pattern "a/b/keep" keeps that nested directory real, and a/b/drop — matched by neither
-    // mechanism — is symlinked. Exercises depth matching and the union of both mechanisms.
     CFCLinkExecFileSystem patternFs =
         newLinkExecFileSystem(
             "nested", /* linkInputDirectories= */ true, ImmutableList.of("a/b/keep"));
@@ -1033,7 +958,6 @@ public class CFCLinkExecFileSystemTest {
             DigestUtil.toDigest(bDirDigest), bDir,
             DigestUtil.toDigest(emptyDirDigest), emptyDir);
 
-    // Output under a/b/out forces a and a/b into the auto-computed exclusion set.
     Command command = Command.newBuilder().addOutputPaths("a/b/out/output.jar").build();
     Action action =
         Action.newBuilder().setInputRootDigest(DigestUtil.toDigest(rootDirDigest)).build();
@@ -1049,15 +973,12 @@ public class CFCLinkExecFileSystemTest {
             WorkerExecutedMetadata.newBuilder());
 
     try {
-      // a and a/b are output-path ancestors (auto-computed) — real, so the walk descends into them.
       assertThat(Files.isSymbolicLink(execDir.resolve("a"))).isFalse();
       assertThat(Files.isSymbolicLink(execDir.resolve("a/b"))).isFalse();
 
-      // a/b/keep matches the pattern at depth — kept real.
       assertThat(Files.isDirectory(execDir.resolve("a/b/keep"))).isTrue();
       assertThat(Files.isSymbolicLink(execDir.resolve("a/b/keep"))).isFalse();
 
-      // a/b/drop matches neither the computed set nor a pattern — symlinked.
       assertThat(Files.isSymbolicLink(execDir.resolve("a/b/drop"))).isTrue();
     } finally {
       patternFs.destroyExecDir(execDir);
@@ -1067,8 +988,6 @@ public class CFCLinkExecFileSystemTest {
   @Test
   public void linkedInputExclusionPatterns_keepNestedDirectoryRealWithoutOutputAncestors()
       throws Exception {
-    // The pattern match itself must keep ancestors real. Otherwise the walk would symlink a/ and
-    // skip the subtree before it ever reaches a/b/keep.
     CFCLinkExecFileSystem patternFs =
         newLinkExecFileSystem(
             "nested-no-output", /* linkInputDirectories= */ true, ImmutableList.of("a/b/keep"));
@@ -1144,8 +1063,6 @@ public class CFCLinkExecFileSystemTest {
 
   @Test
   public void constructorRejectsInvalidExclusionPattern() {
-    // An unparseable exclusion regex fails fast at construction with a message naming the config
-    // field, rather than surfacing an opaque PatternSyntaxException deep in worker startup.
     IllegalArgumentException thrown =
         assertThrows(
             IllegalArgumentException.class,
