@@ -648,11 +648,7 @@ public final class Worker extends LoggingMain {
     try {
       backplane.removeWorker(name, "removing self prior to initialization");
     } catch (IOException e) {
-      Status status = Status.fromThrowable(e);
-      if (status.getCode() != Code.UNAVAILABLE && status.getCode() != Code.DEADLINE_EXCEEDED) {
-        throw status.asRuntimeException();
-      }
-      log.log(INFO, "backplane was unavailable or overloaded, deferring removeWorker");
+      throw Status.fromThrowable(e).asRuntimeException();
     }
   }
 
@@ -700,6 +696,14 @@ public final class Worker extends LoggingMain {
     return Math.min(30, 1L << Math.min(consecutiveFailures, 5));
   }
 
+  static boolean removeStaleWorkerBeforeFirstRegistration(
+      boolean removalPending, Runnable removeWorker) {
+    if (removalPending) {
+      removeWorker.run();
+    }
+    return false;
+  }
+
   private void startFailsafeRegistration(Supplier<Boolean> isReadOnly) {
     String endpoint = configs.getWorker().getPublicName();
     ShardWorker.Builder worker = ShardWorker.newBuilder().setEndpoint(endpoint);
@@ -711,6 +715,7 @@ public final class Worker extends LoggingMain {
             new Runnable() {
               long workerRegistrationExpiresAt = 0;
               int consecutiveFailures = 0;
+              boolean removeBeforeFirstRegistration = true;
 
               ShardWorker nextRegistration(long now) {
                 return worker
@@ -743,6 +748,10 @@ public final class Worker extends LoggingMain {
                 if (now >= workerRegistrationExpiresAt
                     && !context.inGracefulShutdown()
                     && !isWorkerPausedFromNewWork()) {
+                  removeBeforeFirstRegistration =
+                      removeStaleWorkerBeforeFirstRegistration(
+                          removeBeforeFirstRegistration,
+                          () -> removeWorker(configs.getWorker().getPublicName()));
                   // worker must be registered to match
                   addWorker(nextRegistration(now));
                   consecutiveFailures = 0;
@@ -975,8 +984,6 @@ public final class Worker extends LoggingMain {
     server = createServer(serverBuilder, instance, workerProfileService);
     updateRegistrationAwareHealth();
 
-    removeWorker(configs.getWorker().getPublicName());
-
     boolean skipLoad = configs.getWorker().getStorages().getFirst().isSkipLoad();
     ListenableFuture<Void> fileSystemStarted =
         execFileSystem.start(
@@ -985,6 +992,7 @@ public final class Worker extends LoggingMain {
             startWritable);
 
     server.start();
+    PrometheusPublisher.startHttpServer(configs.getPrometheusPort());
     Futures.addCallback(
         fileSystemStarted,
         new FutureCallback<>() {
@@ -993,7 +1001,6 @@ public final class Worker extends LoggingMain {
             log.log(INFO, String.format("%s initialized", identifier));
             storageReady.set(true);
             updateRegistrationAwareHealth();
-            PrometheusPublisher.startHttpServer(configs.getPrometheusPort());
           }
 
           @Override
