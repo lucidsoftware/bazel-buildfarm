@@ -17,6 +17,7 @@ import static com.google.common.truth.Truth.assertThat;
 
 import io.grpc.Status;
 import io.grpc.health.v1.HealthCheckResponse.ServingStatus;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
 
 public class WorkerRegistrationTest {
@@ -54,5 +55,21 @@ public class WorkerRegistrationTest {
     assertThat(Worker.registrationBackoffUpperBoundSeconds(4)).isEqualTo(16);
     assertThat(Worker.registrationBackoffUpperBoundSeconds(5)).isEqualTo(30);
     assertThat(Worker.registrationBackoffUpperBoundSeconds(100)).isEqualTo(30);
+  }
+
+  @Test
+  public void staleWorkerIsRemovedOnlyBeforeFirstRegistration() {
+    AtomicInteger removals = new AtomicInteger();
+
+    boolean removalPending =
+        Worker.removeStaleWorkerBeforeFirstRegistration(
+            /* removalPending= */ true, removals::incrementAndGet);
+    assertThat(removalPending).isFalse();
+    assertThat(removals.get()).isEqualTo(1);
+
+    removalPending =
+        Worker.removeStaleWorkerBeforeFirstRegistration(removalPending, removals::incrementAndGet);
+    assertThat(removalPending).isFalse();
+    assertThat(removals.get()).isEqualTo(1);
   }
 }
