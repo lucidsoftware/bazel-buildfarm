@@ -158,6 +158,11 @@ final class CasShards {
     return shards[key.hashCode() & mask];
   }
 
+  /** Wakes the owning shard after an external event makes an LRU entry evictable. */
+  void requestEvictionSweep(String key) {
+    shardFor(key).requestDrain(EvictorShard.TRIGGER_HARDLINK_RELEASE);
+  }
+
   // === Lifecycle ===
 
   void start() {

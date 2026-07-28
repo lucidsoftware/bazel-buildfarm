@@ -49,7 +49,14 @@ public class Worker {
   private int reportResultStageWidth = 1;
   private boolean linkExecFileSystem = true;
   private boolean linkInputDirectories = true;
-  private List<String> linkedInputDirectories = Arrays.asList("^(?!external$).*$");
+
+  /**
+   * @deprecated Ignored; use {@link #linkedInputExclusionPatterns}.
+   */
+  @Deprecated private List<String> linkedInputDirectories = new ArrayList<>();
+
+  private List<String> linkedInputExclusionPatterns = new ArrayList<>();
+
   private String execOwner;
   private List<String> execOwners = new ArrayList<>();
   private int defaultMaxCores = 0;

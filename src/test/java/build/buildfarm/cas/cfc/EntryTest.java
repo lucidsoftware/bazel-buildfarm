@@ -138,6 +138,19 @@ public class EntryTest {
   }
 
   @Test
+  public void tryEvictShouldRollbackWhenCasDirectoryHardlinkPinned() {
+    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
+    new CasInodeIndex().increment(e, new Object());
+    assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.casDirectoryHardlinkCount()).isEqualTo(1);
+    assertThat(e.isEvictable()).isFalse();
+
+    assertThat(e.tryEvict()).isFalse();
+    assertThat(e.state()).isEqualTo(Entry.State.LIVE);
+    assertThat(e.casDirectoryHardlinkCount()).isEqualTo(1);
+  }
+
+  @Test
   public void tryAcquireShouldFailWhenEntryIsEvicted() {
     // Companion to tryAcquireShouldFailWhenEntryIsEvicting: once the evictor has driven
     // the entry through the terminal EVICTING -> EVICTED transition, a stale caller

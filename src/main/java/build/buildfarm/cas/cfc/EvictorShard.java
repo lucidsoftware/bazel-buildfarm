@@ -250,6 +250,12 @@ final class EvictorShard extends EvictorShardPad1 {
           .labelNames("shard")
           .help("tryEvict EVICTING -> LIVE rollbacks.")
           .register();
+  private static final Counter casDirectoryHardlinkSkipsTotal =
+      Counter.build()
+          .name("evictor_skipped_cas_directory_hardlinks_total")
+          .labelNames("shard")
+          .help("LRU candidates skipped because a CAS directory tree still hardlinks them.")
+          .register();
   private static final Counter wakesTotal =
       Counter.build()
           .name("evictor_wakes_total")
@@ -260,6 +266,8 @@ final class EvictorShard extends EvictorShardPad1 {
   private static final String TRIGGER_BYTE_THRESHOLD = "byte_threshold";
   private static final String TRIGGER_QUEUE_DEPTH = "queue_depth";
   private static final String TRIGGER_SNAPSHOT = "snapshot";
+  // A directory eviction released a source entry's last hardlink.
+  static final String TRIGGER_HARDLINK_RELEASE = "hardlink_release";
   private static final Counter mpscDropsTotal =
       Counter.build()
           .name("mpsc_drops_total")
@@ -374,9 +382,11 @@ final class EvictorShard extends EvictorShardPad1 {
 
   private final Counter.Child evictedChild;
   private final Counter.Child stateRollbacksChild;
+  private final Counter.Child casDirectoryHardlinkSkipsChild;
   private final Counter.Child wakesByteThreshold;
   private final Counter.Child wakesQueueDepth;
   private final Counter.Child wakesSnapshot;
+  private final Counter.Child wakesHardlinkRelease;
   private final Counter.Child mpscDropsAccessChild;
   private final Gauge.Child queueDepthChild;
   private final Counter.Child chargeBackpressureHardCapChild;
@@ -473,9 +483,11 @@ final class EvictorShard extends EvictorShardPad1 {
     this.lowBytes = lowBytes;
     this.evictedChild = evictedTotal.labels(shardLabel);
     this.stateRollbacksChild = stateRollbacksTotal.labels(shardLabel);
+    this.casDirectoryHardlinkSkipsChild = casDirectoryHardlinkSkipsTotal.labels(shardLabel);
     this.wakesByteThreshold = wakesTotal.labels(shardLabel, TRIGGER_BYTE_THRESHOLD);
     this.wakesQueueDepth = wakesTotal.labels(shardLabel, TRIGGER_QUEUE_DEPTH);
     this.wakesSnapshot = wakesTotal.labels(shardLabel, TRIGGER_SNAPSHOT);
+    this.wakesHardlinkRelease = wakesTotal.labels(shardLabel, TRIGGER_HARDLINK_RELEASE);
     this.mpscDropsAccessChild = mpscDropsTotal.labels(shardLabel, "access");
     this.queueDepthChild = queueDepthGauge.labels(shardLabel);
     this.chargeBackpressureHardCapChild =
@@ -781,6 +793,8 @@ final class EvictorShard extends EvictorShardPad1 {
       wakesQueueDepth.inc();
     } else if (trigger == TRIGGER_SNAPSHOT) {
       wakesSnapshot.inc();
+    } else if (trigger == TRIGGER_HARDLINK_RELEASE) {
+      wakesHardlinkRelease.inc();
     } else {
       wakesTotal.labels(shardLabel, trigger).inc();
     }
@@ -1307,6 +1321,12 @@ final class EvictorShard extends EvictorShardPad1 {
           && !stopping) {
         Entry victim = cursor;
         cursor = cursor.after;
+        // Avoid state churn for pinned entries; tryEvict performs the authoritative recheck.
+        if (victim.casDirectoryHardlinkCount() > 0) {
+          casDirectoryHardlinkSkipsChild.inc();
+          skipsBeforeEviction++;
+          continue;
+        }
         if (!victim.tryEvict()) {
           stateRollbackCount.increment();
           stateRollbacksChild.inc();

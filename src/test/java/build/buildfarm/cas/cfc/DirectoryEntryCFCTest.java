@@ -46,17 +46,24 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
 import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileStore;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import org.junit.After;
 import org.junit.Before;
@@ -87,6 +94,11 @@ class DirectoryEntryCFCTest {
 
   protected DirectoryEntryCFCTest(Path fileSystemRoot) {
     this.root = fileSystemRoot.resolve("cache");
+  }
+
+  /** Whether this filesystem reports directory sizes needed for startup admission. */
+  protected boolean startupAdmitsExistingDirectoryTrees() {
+    return false;
   }
 
   @Before
@@ -406,13 +418,659 @@ class DirectoryEntryCFCTest {
 
     getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, directoriesIndex, putService));
 
-    long blobSize = file.size();
-    // DirectoryEntryCFC copies files into _dir entries, so the blob content contributes to
-    // sizeInBytes twice: once as the CAS blob entry, once as the copy within the directory entry.
-    // Without the directory overhead fix, size() would equal 2 * blobSize.
-    // With the fix, size() should include the estimated directory overhead for 2 directories
-    // (the root dir and the empty subdir), making it greater than 2 * blobSize.
-    assertThat(fileCache.size()).isGreaterThan(2 * blobSize);
+    // Content is charged once; the directory contributes only table overhead.
+    long standalone = CASFileCache.estimateSizeOnDisk(file.size(), 4096, /* isHardlink= */ false);
+    long directoryOverhead =
+        CASFileCache.estimateDirectorySizeOnDisk(directory, 4096)
+            + CASFileCache.estimateDirectorySizeOnDisk(subDirectory, 4096);
+    assertThat(fileCache.size()).isEqualTo(standalone + directoryOverhead);
+  }
+
+  /** Builds a single-file directory fixture. */
+  private PutDirectoryFixture putSingleFileDirectory(ByteString file)
+      throws IOException, InterruptedException {
+    Digest fileDigest = DIGEST_UTIL.compute(file);
+    blobs.put(fileDigest, file);
+    Directory directory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("file")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Digest dirDigest = DIGEST_UTIL.compute(directory);
+    Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex =
+        ImmutableMap.of(DigestUtil.toDigest(dirDigest), directory);
+    getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, directoriesIndex, putService));
+    return new PutDirectoryFixture(fileDigest, dirDigest);
+  }
+
+  private record PutDirectoryFixture(Digest fileDigest, Digest dirDigest) {}
+
+  private Object fileKeyOf(Path path) throws IOException {
+    return Files.readAttributes(path, BasicFileAttributes.class).fileKey();
+  }
+
+  @Test
+  public void linkAndReference_succeeds_hardlinkSharesFileKey()
+      throws IOException, InterruptedException {
+    PutDirectoryFixture f = putSingleFileDirectory(ByteString.copyFromUtf8("hardlink me"));
+
+    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
+
+    assertThat(fileKeyOf(inDirectory)).isEqualTo(fileKeyOf(standalone));
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
+  }
+
+  @Test
+  public void linkAndReference_oneFileTwoDirectories_collapsesToSingleInodeWithCountTwo()
+      throws IOException, InterruptedException {
+    ByteString file = ByteString.copyFromUtf8("shared toolchain file");
+    Digest fileDigest = DIGEST_UTIL.compute(file);
+    blobs.put(fileDigest, file);
+
+    Directory d1 =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("alpha")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Directory d2 =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("beta")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Digest d1Digest = DIGEST_UTIL.compute(d1);
+    Digest d2Digest = DIGEST_UTIL.compute(d2);
+    Map<build.bazel.remote.execution.v2.Digest, Directory> index =
+        ImmutableMap.of(
+            DigestUtil.toDigest(d1Digest), d1,
+            DigestUtil.toDigest(d2Digest), d2);
+
+    getInterruptiblyOrIOException(fileCache.putDirectory(d1Digest, index, putService));
+    getInterruptiblyOrIOException(fileCache.putDirectory(d2Digest, index, putService));
+
+    Entry source = storage.get(CASFileCache.getKey(fileDigest, false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(2);
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(1);
+  }
+
+  @Test
+  public void linkAndReference_fileSystemException_fallsBackToCopy()
+      throws IOException, InterruptedException {
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              throw new FileSystemException(destination.toString(), null, "simulated ENOLINK");
+            });
+
+    ByteString file = ByteString.copyFromUtf8("copy fallback content");
+    PutDirectoryFixture f = putSingleFileDirectory(file);
+
+    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
+
+    assertThat(fileKeyOf(inDirectory)).isNotEqualTo(fileKeyOf(standalone));
+    assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void linkAndReference_unsupportedOperation_fallsBackToCopy()
+      throws IOException, InterruptedException {
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              throw new UnsupportedOperationException("hardlinks unavailable");
+            });
+
+    ByteString file = ByteString.copyFromUtf8("unsupported hardlink content");
+    PutDirectoryFixture f = putSingleFileDirectory(file);
+
+    Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
+    assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void linkAndReference_nullSourceFileKey_fallsBackToCopy()
+      throws IOException, InterruptedException {
+    ((DirectoryEntryCFC) fileCache).setSourceFileKeyReaderForTesting(source -> null);
+
+    ByteString file = ByteString.copyFromUtf8("null file key fallback");
+    PutDirectoryFixture f = putSingleFileDirectory(file);
+
+    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
+
+    assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
+    assertThat(fileKeyOf(inDirectory)).isNotEqualTo(fileKeyOf(standalone));
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+  }
+
+  @Test
+  public void linkAndReference_noSuchFileException_fallsBackToReFetch()
+      throws IOException, InterruptedException {
+    AtomicInteger linkCalls = new AtomicInteger();
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              if (linkCalls.getAndIncrement() == 0) {
+                throw new NoSuchFileException(source.toString());
+              }
+              Files.createLink(destination, source);
+            });
+
+    ByteString file = ByteString.copyFromUtf8("refetched content");
+    PutDirectoryFixture f = putSingleFileDirectory(file);
+
+    Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
+    assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
+    assertThat(linkCalls.get()).isAtLeast(2);
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
+    assertThat(fileKeyOf(inDirectory))
+        .isEqualTo(fileKeyOf(fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false))));
+  }
+
+  @Test
+  public void linkAndReference_noSuchFileForDestinationDoesNotRefetch()
+      throws IOException, InterruptedException {
+    AtomicInteger linkCalls = new AtomicInteger();
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              linkCalls.incrementAndGet();
+              throw new NoSuchFileException(destination.toString());
+            });
+
+    assertThrows(
+        Exception.class,
+        () -> putSingleFileDirectory(ByteString.copyFromUtf8("missing destination")));
+
+    assertThat(linkCalls.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void linkAndReference_reFetchFileSystemException_fallsBackToCopy()
+      throws IOException, InterruptedException {
+    AtomicInteger linkCalls = new AtomicInteger();
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              if (linkCalls.getAndIncrement() == 0) {
+                throw new NoSuchFileException(source.toString());
+              }
+              throw new FileSystemException(destination.toString(), null, "simulated EMLINK");
+            });
+
+    ByteString file = ByteString.copyFromUtf8("refetch copy fallback");
+    PutDirectoryFixture f = putSingleFileDirectory(file);
+
+    Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
+    assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(linkCalls.get()).isAtLeast(2);
+  }
+
+  @Test
+  public void linkAndReference_reFetchNullSourceFileKey_fallsBackToCopy()
+      throws IOException, InterruptedException {
+    AtomicInteger linkCalls = new AtomicInteger();
+    AtomicInteger fileKeyReads = new AtomicInteger();
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              linkCalls.incrementAndGet();
+              throw new NoSuchFileException(source.toString());
+            });
+    ((DirectoryEntryCFC) fileCache)
+        .setSourceFileKeyReaderForTesting(
+            source -> fileKeyReads.getAndIncrement() == 0 ? new Object() : null);
+
+    ByteString file = ByteString.copyFromUtf8("refetch null file key fallback");
+    PutDirectoryFixture f = putSingleFileDirectory(file);
+
+    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
+
+    assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
+    assertThat(fileKeyOf(inDirectory)).isNotEqualTo(fileKeyOf(standalone));
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+    assertThat(linkCalls.get()).isEqualTo(1);
+    assertThat(fileKeyReads.get()).isAtLeast(2);
+  }
+
+  @Test
+  public void linkAndReference_failureDecrementsReferenceExactlyOnce()
+      throws IOException, InterruptedException {
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              throw new FileSystemException(destination.toString(), null, "simulated ENOLINK");
+            });
+
+    PutDirectoryFixture f = putSingleFileDirectory(ByteString.copyFromUtf8("release once"));
+
+    Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
+    assertThat(source.refCount()).isEqualTo(0);
+    assertThat(source.isEvictable()).isTrue();
+  }
+
+  @Test
+  public void putDirectory_duplicateChildDirectoryRejectedBeforeMaterialization() throws Exception {
+    ByteString file = ByteString.copyFromUtf8("duplicate child hardlink");
+    Digest fileDigest = DIGEST_UTIL.compute(file);
+    blobs.put(fileDigest, file);
+
+    Directory child =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("file")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Digest childDigest = DIGEST_UTIL.compute(child);
+    Directory root =
+        Directory.newBuilder()
+            .addDirectories(
+                DirectoryNode.newBuilder()
+                    .setName("dup")
+                    .setDigest(DigestUtil.toDigest(childDigest))
+                    .build())
+            .addDirectories(
+                DirectoryNode.newBuilder()
+                    .setName("dup")
+                    .setDigest(DigestUtil.toDigest(childDigest))
+                    .build())
+            .build();
+    Digest rootDigest = DIGEST_UTIL.compute(root);
+    Map<build.bazel.remote.execution.v2.Digest, Directory> index =
+        ImmutableMap.of(
+            DigestUtil.toDigest(rootDigest), root,
+            DigestUtil.toDigest(childDigest), child);
+
+    assertThrows(
+        Exception.class,
+        () -> getInterruptiblyOrIOException(fileCache.putDirectory(rootDigest, index, putService)));
+
+    Entry source = storage.get(CASFileCache.getKey(fileDigest, false));
+    if (source != null) {
+      assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+    }
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+    assertNoTempDirectorySiblings(rootDigest);
+  }
+
+  @Test
+  public void putDirectory_failureCleansRecordedHardlinkPins()
+      throws IOException, InterruptedException {
+    ByteString first = ByteString.copyFromUtf8("first linked before failure");
+    ByteString second = ByteString.copyFromUtf8("second fails");
+    Digest firstDigest = DIGEST_UTIL.compute(first);
+    Digest secondDigest = DIGEST_UTIL.compute(second);
+    blobs.put(firstDigest, first);
+    blobs.put(secondDigest, second);
+
+    Directory directory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("first")
+                    .setDigest(DigestUtil.toDigest(firstDigest))
+                    .build())
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("second")
+                    .setDigest(DigestUtil.toDigest(secondDigest))
+                    .build())
+            .build();
+    Digest dirDigest = DIGEST_UTIL.compute(directory);
+    Map<build.bazel.remote.execution.v2.Digest, Directory> index =
+        ImmutableMap.of(DigestUtil.toDigest(dirDigest), directory);
+
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              if (destination.getFileName().toString().equals("second")) {
+                throw new AccessDeniedException(destination.toString());
+              }
+              Files.createLink(destination, source);
+            });
+
+    assertThrows(
+        Exception.class,
+        () -> getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, index, putService)));
+
+    Entry firstSource = storage.get(CASFileCache.getKey(firstDigest, false));
+    Entry secondSource = storage.get(CASFileCache.getKey(secondDigest, false));
+    assertThat(firstSource.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(secondSource.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting((source, destination) -> Files.createLink(destination, source));
+    getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, index, putService));
+
+    assertThat(firstSource.casDirectoryHardlinkCount()).isEqualTo(1);
+    assertThat(secondSource.casDirectoryHardlinkCount()).isEqualTo(1);
+  }
+
+  @Test
+  public void putDirectory_synchronousTreeFailureWaitsForMaterializersBeforeCleanup()
+      throws Exception {
+    ByteString file = ByteString.copyFromUtf8("linked before missing child");
+    Digest fileDigest = DIGEST_UTIL.compute(file);
+    blobs.put(fileDigest, file);
+    Digest missingChildDigest = DIGEST_UTIL.compute(ByteString.copyFromUtf8("missing child"));
+
+    Directory directory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("file")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .addDirectories(
+                DirectoryNode.newBuilder()
+                    .setName("child")
+                    .setDigest(DigestUtil.toDigest(missingChildDigest))
+                    .build())
+            .build();
+    Digest dirDigest = DIGEST_UTIL.compute(directory);
+    Map<build.bazel.remote.execution.v2.Digest, Directory> index =
+        ImmutableMap.of(DigestUtil.toDigest(dirDigest), directory);
+
+    CountDownLatch linkStarted = new CountDownLatch(1);
+    CountDownLatch releaseLink = new CountDownLatch(1);
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              linkStarted.countDown();
+              try {
+                releaseLink.await();
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+              }
+              Files.createLink(destination, source);
+            });
+
+    ListenableFuture<CASFileCache.PathResult> future =
+        fileCache.putDirectory(dirDigest, index, putService);
+
+    assertThat(linkStarted.await(5, SECONDS)).isTrue();
+    assertThat(future.isDone()).isFalse();
+
+    releaseLink.countDown();
+    assertThrows(Exception.class, () -> getInterruptiblyOrIOException(future));
+
+    Entry source = storage.get(CASFileCache.getKey(fileDigest, false));
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+    assertNoTempDirectorySiblings(dirDigest);
+  }
+
+  private void assertNoTempDirectorySiblings(Digest dirDigest) throws IOException {
+    Path dirPath = fileCache.getDirectoryPath(dirDigest);
+    try (DirectoryStream<Path> stream =
+        Files.newDirectoryStream(dirPath.getParent(), dirPath.getFileName() + ".tmp.*")) {
+      assertThat(stream).isEmpty();
+    }
+  }
+
+  @Test
+  public void evictor_fileWithCasDirectoryHardlinks_evictableOnlyAfterDirectoryEvicts()
+      throws IOException, InterruptedException {
+    // The final hardlink release must wake eviction so the following charge can complete.
+    PutDirectoryFixture f = putSingleFileDirectory(ByteString.copyFromUtf8("pin me"));
+    String fileKey = CASFileCache.getKey(f.fileDigest(), false);
+    String dirKey = fileCache.getDirectoryKey(f.dirDigest());
+
+    fileCache.decrementReferences(
+        ImmutableList.of(),
+        ImmutableList.of(DigestUtil.toDigest(f.dirDigest())),
+        DIGEST_UTIL.getDigestFunction());
+    assertThat(storage.get(fileKey).casDirectoryHardlinkCount()).isEqualTo(1);
+
+    // Requiring the whole cache makes both directory and source eviction deterministic.
+    byte[] big = new byte[(int) (fileCache.maxSize() - 100)];
+    Digest bigDigest = DIGEST_UTIL.compute(ByteString.copyFrom(big));
+    blobs.put(bigDigest, ByteString.copyFrom(big));
+    fileCache.put(bigDigest, false);
+
+    assertThat(storage.get(dirKey)).isNull();
+    assertThat(storage.get(fileKey)).isNull();
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+  }
+
+  @Test
+  public void putDirectory_initialFailureDoesNotPoisonFetchers()
+      throws IOException, InterruptedException {
+    ByteString file = ByteString.copyFromUtf8("eventually available");
+    Digest fileDigest = DIGEST_UTIL.compute(file);
+    Directory directory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("file")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Digest dirDigest = DIGEST_UTIL.compute(directory);
+    Map<build.bazel.remote.execution.v2.Digest, Directory> index =
+        ImmutableMap.of(DigestUtil.toDigest(dirDigest), directory);
+
+    assertThrows(
+        Exception.class,
+        () -> getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, index, putService)));
+
+    blobs.put(fileDigest, file);
+    getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, index, putService));
+
+    Path inDirectory = fileCache.getDirectoryPath(dirDigest).resolve("file");
+    assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
+  }
+
+  @Test
+  public void startupScan_existingDirectoryTrees_populatesInodeMap() throws Exception {
+    byte[] content = "startup hardlinked file".getBytes(StandardCharsets.UTF_8);
+    Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
+    String fileKey = CASFileCache.getKey(fileDigest, false);
+    Path standalone = fileCache.getPath(fileKey);
+    Files.write(standalone, content);
+
+    Directory directory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("file")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Digest dirDigest = DIGEST_UTIL.compute(directory);
+    Path dirPath = fileCache.getDirectoryPath(dirDigest);
+    Files.createDirectories(dirPath);
+    Files.createLink(dirPath.resolve("file"), standalone);
+
+    getInterruptiblyOrIOException(fileCache.start(/* skipLoad= */ false));
+
+    Entry source = storage.get(fileKey);
+    assertThat(source).isNotNull();
+    Entry directoryEntry = storage.get(fileCache.getDirectoryKey(dirDigest));
+    if (startupAdmitsExistingDirectoryTrees()) {
+      assertThat(directoryEntry).isNotNull();
+    } else if (directoryEntry == null) {
+      assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+      assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+      return;
+    }
+    Object standaloneFileKey = fileKeyOf(standalone);
+    Object directoryFileKey = fileKeyOf(dirPath.resolve("file"));
+    if (standaloneFileKey != null && standaloneFileKey.equals(directoryFileKey)) {
+      assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
+      assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(1);
+    } else {
+      // Providers without stable file keys cannot reconstruct the pin.
+      assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+      assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+      assertThat(directoryEntry.size)
+          .isAtLeast(
+              CASFileCache.estimateSizeOnDisk(content.length, 4096, /* isHardlink= */ false));
+    }
+    assertThat(source.refCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void startupScan_snapshotFileWithDirectoryTrees_populatesInodeMap() throws Exception {
+    byte[] content = "startup snapshot hardlinked file".getBytes(StandardCharsets.UTF_8);
+    Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
+    String fileKey = CASFileCache.getKey(fileDigest, false);
+    Path standalone = fileCache.getPath(fileKey);
+    Files.write(standalone, content);
+
+    Directory directory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("file")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Digest dirDigest = DIGEST_UTIL.compute(directory);
+    String dirKey = fileCache.getDirectoryKey(dirDigest);
+    Path dirPath = fileCache.getDirectoryPath(dirDigest);
+    Files.createDirectories(dirPath);
+    Files.createLink(dirPath.resolve("file"), standalone);
+
+    String snapshot = fileKey + "," + content.length + "\n" + dirKey + ",1\n";
+    Files.write(
+        root.resolve(LruSnapshotFiles.name(1, 0)), snapshot.getBytes(StandardCharsets.UTF_8));
+
+    getInterruptiblyOrIOException(fileCache.start(/* skipLoad= */ false));
+
+    Entry source = storage.get(fileKey);
+    assertThat(source).isNotNull();
+    Entry directoryEntry = storage.get(dirKey);
+    if (startupAdmitsExistingDirectoryTrees()) {
+      assertThat(directoryEntry).isNotNull();
+    } else if (directoryEntry == null) {
+      assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+      return;
+    }
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(1);
+  }
+
+  @Test
+  public void put_thenReference_doesNotTouchCasDirectoryHardlinkCount() throws Exception {
+    ByteString blob = ByteString.copyFromUtf8("plain reference");
+    Digest digest = DIGEST_UTIL.compute(blob);
+    blobs.put(digest, blob);
+    fileCache.put(digest, false); // creates and references the entry
+
+    String key = CASFileCache.getKey(digest, false);
+    Entry entry = storage.get(key);
+    assertThat(entry.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(entry.refCount()).isAtLeast(1);
+
+    assertThat(fileCache.referenceIfExists(key)).isTrue();
+    assertThat(entry.casDirectoryHardlinkCount()).isEqualTo(0);
+
+    fileCache.decrementReference(key);
+    fileCache.decrementReference(key);
+    assertThat(entry.casDirectoryHardlinkCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void linkAndReference_reFetchExhausted_propagatesAfterMaxAttempts() {
+    AtomicInteger linkCalls = new AtomicInteger();
+    ((DirectoryEntryCFC) fileCache)
+        .setFileLinkerForTesting(
+            (source, destination) -> {
+              linkCalls.incrementAndGet();
+              throw new NoSuchFileException(source.toString());
+            });
+
+    assertThrows(
+        Exception.class,
+        () -> putSingleFileDirectory(ByteString.copyFromUtf8("always races away")));
+
+    assertThat(linkCalls.get()).isEqualTo(1 + DirectoryEntryCFC.MAX_REFETCH_ATTEMPTS);
+  }
+
+  @Test
+  public void startupScan_directoryHardlinkWithoutIndexedSource_skipsPinReconstruction()
+      throws Exception {
+    byte[] content = "orphaned hardlink".getBytes(StandardCharsets.UTF_8);
+    Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
+    Directory directory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("a")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("b")
+                    .setDigest(DigestUtil.toDigest(fileDigest))
+                    .build())
+            .build();
+    Digest dirDigest = DIGEST_UTIL.compute(directory);
+    Path dirPath = fileCache.getDirectoryPath(dirDigest);
+    Files.createDirectories(dirPath);
+    Files.write(dirPath.resolve("a"), content);
+    Files.createLink(dirPath.resolve("b"), dirPath.resolve("a"));
+    assertThat(Files.getAttribute(dirPath.resolve("a"), "unix:nlink")).isEqualTo(2);
+
+    getInterruptiblyOrIOException(fileCache.start(/* skipLoad= */ false));
+
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
+    Entry directoryEntry = storage.get(fileCache.getDirectoryKey(dirDigest));
+    assertThat(directoryEntry).isNotNull();
+    assertThat(directoryEntry.size)
+        .isAtLeast(CASFileCache.estimateSizeOnDisk(content.length, 4096, /* isHardlink= */ false));
+  }
+
+  @Test
+  public void startupScan_invalidDirectoryDoesNotApplyPendingHardlinkPins() throws Exception {
+    byte[] content = "valid standalone source".getBytes(StandardCharsets.UTF_8);
+    Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
+    String fileKey = CASFileCache.getKey(fileDigest, false);
+    Path standalone = fileCache.getPath(fileKey);
+    Files.write(standalone, content);
+
+    Digest dirDigest = DIGEST_UTIL.compute(ByteString.copyFromUtf8("invalid hardlink dir"));
+    String dirKey = fileCache.getDirectoryKey(dirDigest);
+    Path dirPath = fileCache.getDirectoryPath(dirDigest);
+    Files.createDirectories(dirPath);
+    Files.createLink(dirPath.resolve("hardlink"), standalone);
+    Files.write(dirPath.resolve("oversized"), new byte[(int) fileCache.maxEntrySize() + 1]);
+
+    getInterruptiblyOrIOException(fileCache.start(/* skipLoad= */ false));
+
+    Entry source = storage.get(fileKey);
+    assertThat(source).isNotNull();
+    assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
+    assertThat(storage.get(dirKey)).isNull();
+    assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
   }
 
   @RunWith(JUnit4.class)
@@ -443,6 +1101,11 @@ class DirectoryEntryCFCTest {
     private NativeDirectoryEntryCFCTest(Path tempDir) {
       super(tempDir);
       this.tempDir = tempDir;
+    }
+
+    @Override
+    protected boolean startupAdmitsExistingDirectoryTrees() {
+      return true;
     }
 
     private static Path createTempDirectory() throws IOException {

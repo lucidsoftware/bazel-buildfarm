@@ -164,9 +164,8 @@ public final class Utils {
 
       String name = dirent.d_name.toString();
       if (!name.equals(".") && !name.equals("..")) {
-        dirents.add(
-            new NamedFileKey(
-                name, stat(path.resolve(name), false, fileStore), dirent.d_ino.longValue()));
+        FileStatus stat = stat(path.resolve(name), false, fileStore);
+        dirents.add(new NamedFileKey(name, stat, stat.fileKey()));
       }
       direntPtr = libc.readdir(DIR);
     }
@@ -188,7 +187,7 @@ public final class Utils {
   public static Object getFileKey(Path path, @Nullable FileStatus stat) throws IOException {
     Object fileKey = stat == null ? null : stat.fileKey();
     if (fileKey == null) {
-      fileKey = Files.readAttributes(path, BasicFileAttributes.class);
+      fileKey = toInodeKey(Files.readAttributes(path, BasicFileAttributes.class));
     }
     return fileKey;
   }
@@ -276,6 +275,39 @@ public final class Utils {
     }
   }
 
+  private record UnixInodeKey(String dev, String ino) {}
+
+  /** Normalizes Unix file keys to device-plus-inode identity; other providers pass through. */
+  public static @Nullable Object toInodeKey(@Nullable Object nioFileKey) {
+    if (nioFileKey == null) {
+      return null;
+    }
+    try {
+      String keyStr = nioFileKey.toString();
+      int devStart = keyStr.indexOf("dev=");
+      int devEnd = keyStr.indexOf(',', devStart);
+      int inoStart = keyStr.indexOf("ino=", devEnd);
+      int inoEnd = keyStr.indexOf(')', inoStart);
+      if (devStart < 0 || devEnd < 0 || inoStart < 0 || inoEnd < 0) {
+        return nioFileKey;
+      }
+      return new UnixInodeKey(
+          keyStr.substring(devStart + 4, devEnd), keyStr.substring(inoStart + 4, inoEnd));
+    } catch (Exception e) {
+      return nioFileKey;
+    }
+  }
+
+  public static @Nullable Object toInodeKey(@Nullable BasicFileAttributes attributes) {
+    if (attributes == null) {
+      return null;
+    }
+    if (attributes instanceof DosFileAttributes) {
+      return new WindowsFileKey((DosFileAttributes) attributes);
+    }
+    return toInodeKey(attributes.fileKey());
+  }
+
   public static FileStatus stat(final Path path, final boolean followSymlinks, FileStore fileStore)
       throws IOException {
     final BasicFileAttributes attributes;
@@ -326,21 +358,7 @@ public final class Utils {
 
       @Override
       public Object fileKey() {
-        if (attributes instanceof DosFileAttributes) {
-          return new WindowsFileKey((DosFileAttributes) attributes);
-        }
-        // UnixFileKeys will correspond to a supported "posix" FileAttributeView
-        // This will mean that NamedFileKeys are populated with inodes
-        // We cannot construct UnixFileKeys, so this is our best option to use
-        // fast directory reads.
-        // Windows will leave the fileKey verbatim via NIO for comparison and hashing
-        try {
-          String keyStr = attributes.fileKey().toString();
-          String inode = keyStr.substring(keyStr.indexOf("ino=") + 4, keyStr.indexOf(')'));
-          return Long.parseLong(inode);
-        } catch (Exception e) {
-          return attributes.fileKey();
-        }
+        return toInodeKey(attributes);
       }
 
       @Override
