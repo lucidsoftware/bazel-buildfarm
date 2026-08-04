@@ -157,7 +157,18 @@ public class PersistentExecutor {
             executionName,
             workerFiles);
 
-    coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
+    long persistentWorkerRequestStarted = PersistentWorkerMetrics.startTimer();
+    long toolSetupStarted = PersistentWorkerMetrics.startTimer();
+    try {
+      coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
+    } catch (IOException | RuntimeException e) {
+      PersistentWorkerMetrics.observeRequest(
+          PersistentWorkerMetrics.OUTCOME_TOOL_SETUP_FAILURE, persistentWorkerRequestStarted);
+      throw e;
+    } finally {
+      PersistentWorkerMetrics.observePhase(
+          PersistentWorkerMetrics.PHASE_TOOL_SETUP, toolSetupStarted);
+    }
 
     // Make request
 
@@ -182,7 +193,9 @@ public class PersistentExecutor {
             .setRequestId(0)
             .build();
 
-    RequestCtx requestCtx = new RequestCtx(request, context, workerFiles, timeout);
+    RequestCtx requestCtx =
+        new RequestCtx(
+            request, context, workerFiles, timeout, persistentWorkerRequestStarted);
 
     // Run request
     // Required file operations (in/out) are the responsibility of the coordinator

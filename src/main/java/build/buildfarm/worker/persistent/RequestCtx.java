@@ -16,6 +16,7 @@ package build.buildfarm.worker.persistent;
 
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.protobuf.Duration;
+import java.util.concurrent.atomic.AtomicBoolean;
 import persistent.common.CtxAround;
 
 public class RequestCtx implements CtxAround<WorkRequest> {
@@ -27,16 +28,49 @@ public class RequestCtx implements CtxAround<WorkRequest> {
 
   public final Duration timeout;
 
+  final long metricsStartedNanos;
+
+  private final AtomicBoolean timedOut = new AtomicBoolean(false);
+
+  private volatile String outcome = PersistentWorkerMetrics.OUTCOME_WORKER_ERROR;
+
   public RequestCtx(
       WorkRequest request, WorkFilesContext ctx, WorkerInputs workFiles, Duration timeout) {
+    this(request, ctx, workFiles, timeout, PersistentWorkerMetrics.startTimer());
+  }
+
+  public RequestCtx(
+      WorkRequest request,
+      WorkFilesContext ctx,
+      WorkerInputs workFiles,
+      Duration timeout,
+      long metricsStartedNanos) {
     this.request = request;
     this.filesContext = ctx;
     this.workerInputs = workFiles;
     this.timeout = timeout;
+    this.metricsStartedNanos = metricsStartedNanos;
   }
 
   @Override
   public WorkRequest get() {
     return request;
+  }
+
+  void markTimedOut() {
+    timedOut.set(true);
+    outcome = PersistentWorkerMetrics.OUTCOME_WORKER_TIMEOUT;
+  }
+
+  boolean timedOut() {
+    return timedOut.get();
+  }
+
+  void setOutcome(String outcome) {
+    this.outcome = outcome;
+  }
+
+  String outcome() {
+    return outcome;
   }
 }
