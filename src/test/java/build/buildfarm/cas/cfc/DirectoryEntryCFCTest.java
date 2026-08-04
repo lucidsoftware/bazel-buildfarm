@@ -96,14 +96,7 @@ class DirectoryEntryCFCTest {
     this.root = fileSystemRoot.resolve("cache");
   }
 
-  /**
-   * Whether {@code computeDirectory} admits an existing on-disk {@code _dir} tree at startup on
-   * this test's filesystem. True only on the native variant: {@code computeDirectory} sizes
-   * directories from real on-disk dir sizes, which Jimfs does not model, so on Jimfs the tree may
-   * not admit. The startup-reconstruction test asserts the directory admits when this is true (so a
-   * real admission regression on a native filesystem fails the test) and tolerates non-admission
-   * otherwise.
-   */
+  /** Whether this filesystem reports directory sizes needed for startup admission. */
   protected boolean startupAdmitsExistingDirectoryTrees() {
     return false;
   }
@@ -425,13 +418,7 @@ class DirectoryEntryCFCTest {
 
     getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, directoriesIndex, putService));
 
-    // Phase 3 hardlinks files into _dir entries, so the blob content is charged exactly once (as
-    // the
-    // standalone CAS entry); inside the directory it is a hardlink contributing 0 on-disk blocks.
-    // The
-    // total is therefore the standalone block plus the directory-table overhead of the two
-    // directories (root + empty subdir). Pinning the exact value catches a regression to byte-copy
-    // materialization, which would re-introduce a second full charge for the file's blocks.
+    // Content is charged once; the directory contributes only table overhead.
     long standalone = CASFileCache.estimateSizeOnDisk(file.size(), 4096, /* isHardlink= */ false);
     long directoryOverhead =
         CASFileCache.estimateDirectorySizeOnDisk(directory, 4096)
@@ -439,9 +426,7 @@ class DirectoryEntryCFCTest {
     assertThat(fileCache.size()).isEqualTo(standalone + directoryOverhead);
   }
 
-  // === Phase 3: hardlink-based directory materialization ===
-
-  /** Builds a single-file directory {@code D} containing {@code file} named "file" (non-exec). */
+  /** Builds a single-file directory fixture. */
   private PutDirectoryFixture putSingleFileDirectory(ByteString file)
       throws IOException, InterruptedException {
     Digest fileDigest = DIGEST_UTIL.compute(file);
@@ -475,10 +460,7 @@ class DirectoryEntryCFCTest {
     Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
     Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
 
-    // A hardlink shares the inode: same fileKey. A byte-copy would yield distinct fileKeys.
     assertThat(fileKeyOf(inDirectory)).isEqualTo(fileKeyOf(standalone));
-    // The source Entry now carries exactly one CAS-directory hardlink and is pinned against
-    // eviction even though no one holds a referenceCount on it.
     Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
     assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
   }
@@ -490,7 +472,6 @@ class DirectoryEntryCFCTest {
     Digest fileDigest = DIGEST_UTIL.compute(file);
     blobs.put(fileDigest, file);
 
-    // Two distinct directories (different names around the same file) reference the same file.
     Directory d1 =
         Directory.newBuilder()
             .addFiles(
@@ -519,14 +500,12 @@ class DirectoryEntryCFCTest {
 
     Entry source = storage.get(CASFileCache.getKey(fileDigest, false));
     assertThat(source.casDirectoryHardlinkCount()).isEqualTo(2);
-    // Both directories hardlink the same inode, so the inode index holds exactly one mapping.
     assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(1);
   }
 
   @Test
   public void linkAndReference_fileSystemException_fallsBackToCopy()
       throws IOException, InterruptedException {
-    // ENOLINK-class failure: hardlink unavailable, so the file is byte-copied onto a fresh inode.
     ((DirectoryEntryCFC) fileCache)
         .setFileLinkerForTesting(
             (source, destination) -> {
@@ -539,10 +518,8 @@ class DirectoryEntryCFCTest {
     Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
     Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
 
-    // The copy lives on a fresh inode (distinct fileKey) but byte-matches the source.
     assertThat(fileKeyOf(inDirectory)).isNotEqualTo(fileKeyOf(standalone));
     assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
-    // No CAS-directory hardlink was created, so the source's counter stays 0.
     Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
     assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
   }
@@ -586,8 +563,6 @@ class DirectoryEntryCFCTest {
   @Test
   public void linkAndReference_noSuchFileException_fallsBackToReFetch()
       throws IOException, InterruptedException {
-    // First link attempt simulates the Phase-2.1 evictor rename race (NoSuchFileException); the
-    // re-fetch path re-materializes the source and links it on the retry.
     AtomicInteger linkCalls = new AtomicInteger();
     ((DirectoryEntryCFC) fileCache)
         .setFileLinkerForTesting(
@@ -603,11 +578,7 @@ class DirectoryEntryCFCTest {
 
     Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
     assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
-    // The retried link did go through, so more than one link attempt was made.
     assertThat(linkCalls.get()).isAtLeast(2);
-    // The re-fetch path re-materialized the source as a CAS entry and hardlinked dst to it, so it
-    // is pinned exactly like the happy path (proves the re-fetch ran and recorded the hardlink, not
-    // merely that some link succeeded). The dir file shares the source inode.
     Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
     assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
     assertThat(fileKeyOf(inDirectory))
@@ -688,8 +659,6 @@ class DirectoryEntryCFCTest {
   @Test
   public void linkAndReference_failureDecrementsReferenceExactlyOnce()
       throws IOException, InterruptedException {
-    // After a copy-fallback materialization the source must be released exactly once: not pinned by
-    // referenceCount (nothing else references it) and not double-released (which would underflow).
     ((DirectoryEntryCFC) fileCache)
         .setFileLinkerForTesting(
             (source, destination) -> {
@@ -869,28 +838,18 @@ class DirectoryEntryCFCTest {
   @Test
   public void evictor_fileWithCasDirectoryHardlinks_evictableOnlyAfterDirectoryEvicts()
       throws IOException, InterruptedException {
-    // This test also guards the deadlock fix: the source is reclaimed only after the directory's
-    // async tree-walk decrements its hardlink count and wakes the shard via requestEvictionSweep.
-    // Without that wake the evictor parks in stuckAboveLow with the source skipped, the charger
-    // below never gets its space, and this test hangs (times out) rather than failing fast.
+    // The final hardlink release must wake eviction so the following charge can complete.
     PutDirectoryFixture f = putSingleFileDirectory(ByteString.copyFromUtf8("pin me"));
     String fileKey = CASFileCache.getKey(f.fileDigest(), false);
     String dirKey = fileCache.getDirectoryKey(f.dirDigest());
 
-    // Release the directory's own reference; it is now eligible for eviction, but the source file
-    // remains pinned by its CAS-directory hardlink (the sweep skips casDirectoryHardlinkCount > 0
-    // entries even though refCount == 0).
     fileCache.decrementReferences(
         ImmutableList.of(),
         ImmutableList.of(DigestUtil.toDigest(f.dirDigest())),
         DIGEST_UTIL.getDigestFunction());
     assertThat(storage.get(fileKey).casDirectoryHardlinkCount()).isEqualTo(1);
 
-    // Force eviction by charging a blob that needs the whole cache. The directory must evict first,
-    // then its tree-walk releases the source's hardlink, then the source evicts. put() only returns
-    // once enough space is freed, which (since the blob needs the whole cache) requires BOTH the
-    // directory and the source to be gone — so the post-conditions below hold deterministically
-    // without waiting on the evictor.
+    // Requiring the whole cache makes both directory and source eviction deterministic.
     byte[] big = new byte[(int) (fileCache.maxSize() - 100)];
     Digest bigDigest = DIGEST_UTIL.compute(ByteString.copyFrom(big));
     blobs.put(bigDigest, ByteString.copyFrom(big));
@@ -904,9 +863,6 @@ class DirectoryEntryCFCTest {
   @Test
   public void putDirectory_initialFailureDoesNotPoisonFetchers()
       throws IOException, InterruptedException {
-    // The file blob is absent from the delegate, so the first putDirectory fails. A failed fetch
-    // future must not stay cached (cache poisoning); the second call, after the blob is available,
-    // must start a fresh fetch and succeed.
     ByteString file = ByteString.copyFromUtf8("eventually available");
     Digest fileDigest = DIGEST_UTIL.compute(file);
     Directory directory =
@@ -925,7 +881,6 @@ class DirectoryEntryCFCTest {
         Exception.class,
         () -> getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, index, putService)));
 
-    // Make the blob available and retry; a poisoned fetcher cache would replay the failure.
     blobs.put(fileDigest, file);
     getInterruptiblyOrIOException(fileCache.putDirectory(dirDigest, index, putService));
 
@@ -935,9 +890,6 @@ class DirectoryEntryCFCTest {
 
   @Test
   public void startupScan_existingDirectoryTrees_populatesInodeMap() throws Exception {
-    // Reproduce the on-disk state a prior run leaves behind: a standalone CAS file plus a _dir tree
-    // whose file is a hardlink to it. After startup, the inode index must be reconstructed so the
-    // source is re-pinned against eviction while the directory still references its inode.
     byte[] content = "startup hardlinked file".getBytes(StandardCharsets.UTF_8);
     Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
     String fileKey = CASFileCache.getKey(fileDigest, false);
@@ -955,7 +907,6 @@ class DirectoryEntryCFCTest {
     Digest dirDigest = DIGEST_UTIL.compute(directory);
     Path dirPath = fileCache.getDirectoryPath(dirDigest);
     Files.createDirectories(dirPath);
-    // Hardlink the directory's file to the standalone CAS inode (nlink becomes 2).
     Files.createLink(dirPath.resolve("file"), standalone);
 
     getInterruptiblyOrIOException(fileCache.start(/* skipLoad= */ false));
@@ -964,13 +915,8 @@ class DirectoryEntryCFCTest {
     assertThat(source).isNotNull();
     Entry directoryEntry = storage.get(fileCache.getDirectoryKey(dirDigest));
     if (startupAdmitsExistingDirectoryTrees()) {
-      // On a native filesystem computeDirectory admits the tree (it sizes directories from real
-      // on-disk dir sizes), so a null here is a real admission regression, not a provider quirk.
-      // Fail rather than silently passing through the early return below.
       assertThat(directoryEntry).isNotNull();
     } else if (directoryEntry == null) {
-      // Jimfs does not model on-disk directory sizes, so computeDirectory may not admit the tree.
-      // With no _dir entry there is nothing to hold a pin, and the index must stay empty.
       assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
       assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
       return;
@@ -981,17 +927,13 @@ class DirectoryEntryCFCTest {
       assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
       assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(1);
     } else {
-      // Some test providers expose nlink but not a stable BasicFileAttributes.fileKey(). In that
-      // case startup cannot safely map the directory hardlink back to its standalone source, so it
-      // charges the linked inode to the directory instead of reconstructing a pin.
+      // Providers without stable file keys cannot reconstruct the pin.
       assertThat(source.casDirectoryHardlinkCount()).isEqualTo(0);
       assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
       assertThat(directoryEntry.size)
           .isAtLeast(
               CASFileCache.estimateSizeOnDisk(content.length, 4096, /* isHardlink= */ false));
     }
-    // When reconstructed, the pin keeps the source skipped by the evictor even though nothing holds
-    // a referenceCount on it.
     assertThat(source.refCount()).isEqualTo(0);
   }
 
@@ -1038,9 +980,6 @@ class DirectoryEntryCFCTest {
 
   @Test
   public void put_thenReference_doesNotTouchCasDirectoryHardlinkCount() throws Exception {
-    // The two counters are independent. A plain reference (the same referenceCount path exec-root
-    // hardlinks use) never touches casDirectoryHardlinkCount — only DirectoryEntryCFC's tree
-    // materialization does. Guards against a future change conflating the two.
     ByteString blob = ByteString.copyFromUtf8("plain reference");
     Digest digest = DIGEST_UTIL.compute(blob);
     blobs.put(digest, blob);
@@ -1054,7 +993,6 @@ class DirectoryEntryCFCTest {
     assertThat(fileCache.referenceIfExists(key)).isTrue();
     assertThat(entry.casDirectoryHardlinkCount()).isEqualTo(0);
 
-    // Release both references; the counter is still untouched.
     fileCache.decrementReference(key);
     fileCache.decrementReference(key);
     assertThat(entry.casDirectoryHardlinkCount()).isEqualTo(0);
@@ -1062,10 +1000,6 @@ class DirectoryEntryCFCTest {
 
   @Test
   public void linkAndReference_reFetchExhausted_propagatesAfterMaxAttempts() {
-    // Every link attempt simulates the Phase-2.1 evictor rename race, so the bounded re-fetch loop
-    // exhausts its budget and the failure propagates to the action instead of livelocking. The
-    // initial link plus MAX_REFETCH_ATTEMPTS re-fetch attempts each invoke the linker exactly once;
-    // guards the retry bound against an off-by-one or an unbounded loop.
     AtomicInteger linkCalls = new AtomicInteger();
     ((DirectoryEntryCFC) fileCache)
         .setFileLinkerForTesting(
@@ -1084,10 +1018,6 @@ class DirectoryEntryCFCTest {
   @Test
   public void startupScan_directoryHardlinkWithoutIndexedSource_skipsPinReconstruction()
       throws Exception {
-    // Reproduce the on-disk state after a standalone source was evicted while CAS-directory
-    // hardlinks to its inode survive (or a warm-snapshot source the full scan never indexed): the
-    // _dir files have nlink > 1 but no source Entry is in the startup inode index. Reconstruction
-    // must skip the pin (logged FINE) rather than fail, and the directory must still admit.
     byte[] content = "orphaned hardlink".getBytes(StandardCharsets.UTF_8);
     Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
     Directory directory =
@@ -1106,16 +1036,12 @@ class DirectoryEntryCFCTest {
     Digest dirDigest = DIGEST_UTIL.compute(directory);
     Path dirPath = fileCache.getDirectoryPath(dirDigest);
     Files.createDirectories(dirPath);
-    // Two files hardlinked to each other (nlink == 2) and no standalone CAS file for the inode.
     Files.write(dirPath.resolve("a"), content);
     Files.createLink(dirPath.resolve("b"), dirPath.resolve("a"));
-    // Guard against a vacuous pass: the walk must actually take the nlink > 1 hardlink branch.
     assertThat(Files.getAttribute(dirPath.resolve("a"), "unix:nlink")).isEqualTo(2);
 
-    // Startup must not throw despite the hardlinked files having no indexed source.
     getInterruptiblyOrIOException(fileCache.start(/* skipLoad= */ false));
 
-    // No source Entry was indexed, so no pin is reconstructed and the index stays empty.
     assertThat(((DirectoryEntryCFC) fileCache).casInodeIndexForTesting().size()).isEqualTo(0);
     Entry directoryEntry = storage.get(fileCache.getDirectoryKey(dirDigest));
     assertThat(directoryEntry).isNotNull();

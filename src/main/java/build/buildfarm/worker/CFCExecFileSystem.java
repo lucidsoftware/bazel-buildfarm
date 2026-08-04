@@ -77,7 +77,26 @@ public class CFCExecFileSystem implements ExecFileSystem {
       Histogram.build()
           .name("materialize_exec_root_seconds")
           .labelNames("kind")
-          .buckets(0.001, 0.01, 0.1, 0.5, 1, 5, 10, 30)
+          .buckets(
+              0.001,
+              0.005,
+              0.01,
+              0.025,
+              0.05,
+              0.075,
+              0.1,
+              0.15,
+              0.2,
+              0.3,
+              0.5,
+              0.75,
+              1,
+              1.5,
+              2,
+              3,
+              5,
+              10,
+              30)
           .help("Wall time to materialize an action exec root, by materialization kind.")
           .register();
   // materialize_path_total{method}: composition of a materialization -- how much is cheap linking
