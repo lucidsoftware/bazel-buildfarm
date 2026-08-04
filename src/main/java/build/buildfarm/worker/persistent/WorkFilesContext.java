@@ -38,6 +38,8 @@ public class WorkFilesContext {
 
   private ImmutableMap<Path, Input> pathInputs = null;
 
+  private ImmutableMap<Path, Long> pathInputSizes = null;
+
   private ImmutableMap<Path, Input> toolInputs = null;
 
   public WorkFilesContext(
@@ -81,5 +83,14 @@ public class WorkFilesContext {
       }
     }
     return toolInputs;
+  }
+
+  public ImmutableMap<Path, Long> getPathInputSizes() {
+    synchronized (this) {
+      if (pathInputSizes == null) {
+        pathInputSizes = inputsIndexer.getInputSizes();
+      }
+    }
+    return pathInputSizes;
   }
 }

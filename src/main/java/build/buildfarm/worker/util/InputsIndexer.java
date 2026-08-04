@@ -46,6 +46,7 @@ public class InputsIndexer {
 
   ImmutableMap<Path, FileNode> files = null;
   ImmutableMap<Path, Input> absPathInputs = null;
+  ImmutableMap<Path, Long> inputSizes = null;
   ImmutableMap<Path, Input> toolInputs = null;
 
   public InputsIndexer(Tree tree, Path opRoot) {
@@ -91,6 +92,19 @@ public class InputsIndexer {
       toolInputs = inputs.build();
     }
     return toolInputs;
+  }
+
+  /** Returns input sizes from the already-loaded Merkle tree without filesystem metadata calls. */
+  public ImmutableMap<Path, Long> getInputSizes() {
+    if (inputSizes == null) {
+      ImmutableMap.Builder<Path, Long> sizes = ImmutableMap.builder();
+      for (Map.Entry<Path, FileNode> pathAndFile : getAllFiles().entrySet()) {
+        Path absPath = this.opRoot.resolve(pathAndFile.getKey()).normalize();
+        sizes.put(absPath, pathAndFile.getValue().getDigest().getSizeBytes());
+      }
+      inputSizes = sizes.build();
+    }
+    return inputSizes;
   }
 
   private ImmutableMap<Path, FileNode> getAllFiles() {
