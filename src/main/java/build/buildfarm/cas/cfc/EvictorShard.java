@@ -266,10 +266,7 @@ final class EvictorShard extends EvictorShardPad1 {
   private static final String TRIGGER_BYTE_THRESHOLD = "byte_threshold";
   private static final String TRIGGER_QUEUE_DEPTH = "queue_depth";
   private static final String TRIGGER_SNAPSHOT = "snapshot";
-  // Phase 3: a CAS-directory tree eviction released the last hardlink to a source, so a previously
-  // skipped (casDirectoryHardlinkCount > 0) entry is now evictable. The decrementing walker wakes
-  // the source's shard with this trigger so an evictor parked in the stuckAboveLow state re-sweeps
-  // rather than waiting for a charge/release that may never come.
+  // A directory eviction released a source entry's last hardlink.
   static final String TRIGGER_HARDLINK_RELEASE = "hardlink_release";
   private static final Counter mpscDropsTotal =
       Counter.build()
@@ -1324,13 +1321,7 @@ final class EvictorShard extends EvictorShardPad1 {
           && !stopping) {
         Entry victim = cursor;
         cursor = cursor.after;
-        // Phase 3: a file still hardlinked into a CAS directory tree must not be evicted — its
-        // blocks are accounted to this Entry and the directory tree depends on the inode. Skip it
-        // (volatile read, no state mutation) and advance the cursor freely; it becomes eligible
-        // once the last referencing directory's eviction walker decrements the count back to 0.
-        // This pre-skip is an optimization that avoids the EVICTING-CAS churn for pinned entries;
-        // tryEvict re-reads casDirectoryHardlinkCount under the EVICTING state and is the
-        // authoritative check against a racing 0->1 increment (see Entry.tryEvict).
+        // Avoid state churn for pinned entries; tryEvict performs the authoritative recheck.
         if (victim.casDirectoryHardlinkCount() > 0) {
           casDirectoryHardlinkSkipsChild.inc();
           skipsBeforeEviction++;

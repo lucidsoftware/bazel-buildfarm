@@ -283,17 +283,10 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
   private Thread prometheusMetricsThread;
 
-  // Phase 3 startup map population. Set false at the top of scanRoot and true once the standalone
-  // file scan has fully admitted every standalone Entry into storage. computeDirectory's
-  // CAS-directory-hardlink reconstruction looks up source Entries by inode, so it must not run
-  // until the standalone scan is complete (Phase 3 invariant 8). Always-on Preconditions check
-  // (not a -ea assert) per codebase convention.
+  // Directory reconstruction requires the standalone scan's inode index to be complete.
   protected volatile boolean standaloneScanComplete;
 
-  // Inode -> standalone Entry, built during startup so computeDirectory can pin the source Entries
-  // that existing on-disk _dir trees hardlink. This is cleared immediately after directory
-  // reconstruction; retaining it would duplicate one inode map entry per scanned standalone file
-  // for the cache lifetime.
+  // Temporary inode index used to reconstruct hardlink pins during startup.
   private ConcurrentMap<Object, Entry> startupFileKeys = new ConcurrentHashMap<>();
 
   public long size() {
@@ -2105,8 +2098,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         }
         boolean admitted = false;
         try {
-          // Stat-free fast path: no inode available, so this entry is not added to the startup
-          // inode index (see startupFileKeys).
           admitFileAtStartup(onStartPut, fastPath.fileEntryKey(), diskSize, /* fileKey= */ null);
           admitted = true;
         } finally {
@@ -2198,9 +2189,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     Entry e = Entry.orphan(key, fileEntryKey.size(), Deadline.after(10, SECONDS));
     checkState(storage.put(e.key, e) == null, key);
     onStartPut.accept(fileEntryKey.digest());
-    // Record the inode -> Entry mapping so computeDirectory can pin source Entries that existing
-    // _dir trees hardlink (Phase 3 invariant 8). Only the stat-bearing full-scan path supplies a
-    // non-null fileKey; the stat-free snapshot fast path passes null and is not indexed here.
     if (fileKey != null) {
       startupFileKeys.put(fileKey, e);
     }
@@ -2239,13 +2227,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       }
     }
 
-    // Single pass over the scanned files for two startup decisions:
-    //  - Sweep any orphan _removed files left behind by JVM crashes between safeStorageRemoval's
-    //    rename and the async Files.delete actually running. The basename ends in "_removed" — no
-    //    parseFileEntryKey path ever sees this suffix.
-    //  - Detect whether any CAS-directory tree (_dir) exists. If so, reconstructing its hardlink
-    //    pins needs every standalone file indexed by inode, which forces loadSnapshots to stat each
-    //    entry rather than trust the snapshot's recorded size.
+    // Existing directory trees require inode-aware scanning; also reclaim crash orphans.
     Set<Path> orphansToDelete = null;
     boolean requireFileKeysForDirectoryHardlinks = false;
     for (Path file : files) {
@@ -2297,9 +2279,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     joinThreads(pool, "Scanning Cache Root...");
 
-    // Every standalone Entry is now in storage and indexed by inode (full-scan path).
-    // computeDirectory
-    // may now reconstruct CAS-directory-hardlink pins (Phase 3 invariant 8).
     standaloneScanComplete = true;
 
     // log information from scanning cache root.
@@ -3303,10 +3282,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         boolean storageOwnsReservation = false;
         try {
           try {
-            // createLink runs before the per-key lock acquired in safeStorageInsertion: a
-            // concurrent evictor mid-safeStorageRemoval for the same key still holds the canonical
-            // file, so createLink throws FileAlreadyExistsException and we fall through to the
-            // "look up the existing entry" polling branch below.
+            // An eviction race reports FileAlreadyExists and falls through to the lookup below.
             Files.createLink(canonicalPath, writePath);
             existingEntry = safeStorageInsertion(key, entry);
             inserted = existingEntry == null;
@@ -3342,7 +3318,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           if (existingEntry != null) {
             log.log(Level.FINER, "lost the race to insert " + key);
             if (!referenceIfExists(key)) {
-              // we would lose our accountability and have a presumed reference if we returned
               throw new IllegalStateException("storage conflict with existing key for " + key);
             }
           } else if (writeWinner.get()) {
@@ -3423,17 +3398,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     @SuppressWarnings("unused")
     volatile State state;
 
-    // Counts hardlinks held by CAS-internal directory tree construction — specifically, hardlinks
-    // created by DirectoryEntryCFC.linkAndReference. Other hardlinks to this Entry's inode (e.g.,
-    // exec-root hardlinks created by CFCLinkExecFileSystem.put) are tracked separately via
-    // referenceCount, because their cleanup path has the key in hand and decrements via
-    // storage.get(key). This counter exists specifically because the directory tree walker
-    // (during parent-dir eviction) does NOT have the source key — only the file's inode — and
-    // must look up the source Entry via the CasInodeIndex. Keeping this counter separate from
-    // referenceCount lets us clean the index eagerly (on the 1->0 transition); a single combined
-    // counter would force lazy cleanup at full eviction and bloat the map at scale. Mutations go
-    // through CasInodeIndex (which pairs the atomic update with the inode-keyed map bookkeeping),
-    // never directly.
+    // Tracks CAS-directory links separately because cleanup identifies sources by inode, not key.
     @SuppressWarnings("unused")
     volatile int casDirectoryHardlinkCount;
 
@@ -3476,21 +3441,12 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       return (State) STATE.getVolatile(this);
     }
 
-    /**
-     * Volatile read of the CAS-directory-hardlink count. {@code > 0} pins the Entry against
-     * eviction — the evictor's sweep skips such entries (see {@link EvictorShard}). Read by both
-     * the sweep and {@link CasInodeIndex}'s re-read-inside-compute pattern.
-     */
+    /** Returns the number of CAS-directory hardlinks pinning this entry. */
     public int casDirectoryHardlinkCount() {
       return (int) CAS_DIRECTORY_HARDLINK_COUNT.getVolatile(this);
     }
 
-    /**
-     * Atomic {@code getAndAdd} on the CAS-directory-hardlink count, returning the previous value.
-     * Package-private and intended for use only by {@link CasInodeIndex}, which pairs the atomic
-     * update with the inode-keyed map bookkeeping. The VarHandle stays encapsulated here, next to
-     * the field it guards; the indexing strategy stays in {@code CasInodeIndex}.
-     */
+    /** Updates the hardlink count; only {@link CasInodeIndex} should call this. */
     int getAndAddCasDirectoryHardlinkCount(int delta) {
       return (int) CAS_DIRECTORY_HARDLINK_COUNT.getAndAdd(this, delta);
     }
@@ -3566,12 +3522,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       }
     }
 
-    /**
-     * CAS state LIVE -> EVICTING, then re-check both refCount and casDirectoryHardlinkCount under
-     * the published EVICTING state. Returns true if the caller now owns the eviction; false
-     * otherwise (entry resurrected via a concurrent acquire, or still pinned by a CAS-directory
-     * hardlink — the state is rolled back to LIVE in either case).
-     */
+    /** Claims eviction, then rolls back if a reference or hardlink pins the entry. */
     public boolean tryEvict() {
       if (!STATE.compareAndSet(this, State.LIVE, State.EVICTING)) {
         return false;
@@ -3586,13 +3537,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             key);
         return false;
       }
-      // A CAS-directory tree still hardlinks this source's inode: evicting it would delete the
-      // standalone file and discharge its bytes while the directory hardlink keeps the inode's
-      // blocks on disk (an accounting leak) and strands a stale CasInodeIndex mapping. The EVICTING
-      // state we just published is the serialization point: a concurrent linkAndReference either
-      // still holds src's refCount (caught above) or has already driven the count 0 -> 1 (caught
-      // here), and any acquire arriving after the CAS fails in tryAcquire. The sweep's pre-skip on
-      // casDirectoryHardlinkCount() > 0 is an optimization; this recheck is authoritative.
+      // Recheck after publishing EVICTING to serialize against a new directory hardlink.
       if (casDirectoryHardlinkCount() != 0) {
         checkState(
             STATE.compareAndSet(this, State.EVICTING, State.LIVE),

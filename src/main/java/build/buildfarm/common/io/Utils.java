@@ -277,18 +277,7 @@ public final class Utils {
 
   private record UnixInodeKey(String dev, String ino) {}
 
-  /**
-   * Normalizes an NIO {@link BasicFileAttributes#fileKey()} into a stable inode-identity key. On
-   * Unix providers {@code fileKey()} is a {@code UnixFileKey} whose {@code toString()} is {@code
-   * (dev=..,ino=..)}; we parse both components because inode numbers are unique only within a
-   * device. Providers whose key does not match that shape (Windows, Jimfs) fall back to the
-   * verbatim NIO key, which is itself comparable across call sites. Returns {@code null} when
-   * {@code nioFileKey} is null.
-   *
-   * <p>{@link #stat} applies this so {@code FileStatus.fileKey()} and any caller that normalizes a
-   * raw NIO key land in the same map bucket — see {@code CasInodeIndex}, whose keys are produced
-   * from both startup {@code stat} reads and runtime {@code walkFileTree} attrs.
-   */
+  /** Normalizes Unix file keys to device-plus-inode identity; other providers pass through. */
   public static @Nullable Object toInodeKey(@Nullable Object nioFileKey) {
     if (nioFileKey == null) {
       return null;

@@ -15,46 +15,23 @@
 package build.buildfarm.cas.cfc;
 
 import build.buildfarm.cas.cfc.CASFileCache.Entry;
+import io.prometheus.client.Counter;
 import java.util.concurrent.ConcurrentHashMap;
 import org.jspecify.annotations.Nullable;
 
-/**
- * Owns the inode-to-{@link Entry} map and the bookkeeping that keeps {@code
- * Entry.casDirectoryHardlinkCount} synchronized with that map. {@code DirectoryEntryCFC} hardlinks
- * CAS files into CAS-internal directory trees; the directory tree walker that runs at parent-dir
- * eviction does not have the source CAS key — only the destination file's inode — so it must look
- * up the source {@code Entry} by inode identity ({@code BasicFileAttributes.fileKey()}) to
- * decrement.
- *
- * <p>The two methods below are the only sanctioned way to mutate {@code
- * Entry.casDirectoryHardlinkCount}. They pair the atomic counter update with the conditional map
- * insert/remove using a re-read-inside-{@code compute} pattern so concurrent 0&harr;1 transitions
- * resolve deterministically. Callers must never touch the underlying counter or map directly —
- * reasoning about correctness lives here, not at every call site.
- *
- * <p>The map's lifecycle belongs here rather than on {@code Entry}: {@code Entry} is a CAS data
- * record, unaware of the indexing strategy.
- */
+/** Maps hardlinked file inodes to their source CAS entries. */
 final class CasInodeIndex {
-  // Keyed by Object because BasicFileAttributes.fileKey() returns Object — the JDK does not provide
-  // a shared interface across UnixFileKey (Linux/macOS), WindowsFileKey, and other providers'
-  // implementations. Each concrete class implements equals() and hashCode() on the underlying inode
-  // identity, so Object works correctly as the map key; we just can't declare a more specific type.
+  // Makes hardlink-accounting bugs visible outside logs.
+  private static final Counter hardlinkCountUnderflowTotal =
+      Counter.build()
+          .name("cas_hardlink_count_underflow_total")
+          .help("casDirectoryHardlinkCount decrement underflows (accounting-bug canary; expect 0).")
+          .register();
+
+  // BasicFileAttributes.fileKey() has no more specific cross-platform type.
   private final ConcurrentHashMap<Object, Entry> map = new ConcurrentHashMap<>();
 
-  /**
-   * Atomically increments {@code entry.casDirectoryHardlinkCount} and, on the 0&rarr;1 transition,
-   * inserts ({@code fileKey} &rarr; {@code entry}) into the index. The compute callback re-reads
-   * the counter so a concurrent decrement that already drove the count back to 0 does not leave a
-   * stale mapping behind.
-   *
-   * <p>The insert overwrites any existing mapping for {@code fileKey}, which is intentional and
-   * safe under inode reuse: the OS can hand {@code fileKey}'s inode to a different file only after
-   * the prior occupant's last hardlink is gone — i.e. after its count already reached 0 (removing
-   * its mapping) and it was evicted (freeing the inode). So at most one {@code Entry} ever holds
-   * {@code count > 0} for a given {@code fileKey} at a time, and the overwrite only ever replaces a
-   * logically-dead mapping.
-   */
+  /** Increments the hardlink count and indexes the first link. */
   void increment(Entry entry, Object fileKey) {
     int old = entry.getAndAddCasDirectoryHardlinkCount(1);
     if (old == 0) {
@@ -64,27 +41,15 @@ final class CasInodeIndex {
   }
 
   /**
-   * Atomically decrements {@code entry.casDirectoryHardlinkCount} and, on the 1&rarr;0 transition,
-   * removes the ({@code fileKey} &rarr; {@code entry}) mapping from the index.
+   * Decrements the hardlink count and removes the final link from the index.
    *
-   * <p>Throws {@link IllegalStateException} on underflow (caller bug — double-decrement, decrement
-   * without a prior increment, or a walker visiting a file twice), matching the codebase convention
-   * of failing fast on refcount-discipline violations. Recovery (e.g. floor-at-zero) would silently
-   * leak index entries and produce permanently-unevictable Entries — a worse failure mode than a
-   * fail-fast crash.
-   *
-   * @return the count this decrement produced (the value the atomic transitioned to, ignoring
-   *     concurrent mutations). A return of {@code 0} means this call performed the 1&rarr;0
-   *     transition and owns waking the source's evictor. Deciding the wake off this returned value
-   *     rather than a separate re-read of the counter closes a last-decrementer race: if every
-   *     decrementer that drives the count to 0 instead observed a transient {@code > 0} from an
-   *     interleaved increment, no one would issue the wake and the now-evictable source would sit
-   *     skipped until the idle heartbeat.
+   * @return the count produced by this decrement; zero means the caller must wake the evictor
    */
   int decrement(Entry entry, Object fileKey) {
     int old = entry.getAndAddCasDirectoryHardlinkCount(-1);
     if (old <= 0) {
       entry.getAndAddCasDirectoryHardlinkCount(1);
+      hardlinkCountUnderflowTotal.inc();
       throw new IllegalStateException(
           "entry " + entry.key + " casDirectoryHardlinkCount underflow (was " + old + ")");
     }
