@@ -32,6 +32,8 @@ public class WorkerInputs {
   public final ImmutableSet<Path> opToolInputs;
   public final ImmutableMap<Path, Input> allInputs;
 
+  private final ImmutableMap<Path, Long> inputSizes;
+
   public final ImmutableSet<Path> allToolInputs;
 
   public WorkerInputs(
@@ -39,10 +41,20 @@ public class WorkerInputs {
       ImmutableSet<Path> absToolInputs,
       ImmutableSet<Path> opToolInputs,
       ImmutableMap<Path, Input> allInputs) {
+    this(opRoot, absToolInputs, opToolInputs, allInputs, ImmutableMap.of());
+  }
+
+  public WorkerInputs(
+      Path opRoot,
+      ImmutableSet<Path> absToolInputs,
+      ImmutableSet<Path> opToolInputs,
+      ImmutableMap<Path, Input> allInputs,
+      ImmutableMap<Path, Long> inputSizes) {
     this.opRoot = opRoot;
     this.absToolInputs = absToolInputs;
     this.opToolInputs = opToolInputs;
     this.allInputs = allInputs;
+    this.inputSizes = inputSizes;
 
     this.allToolInputs =
         ImmutableSet.<Path>builder().addAll(absToolInputs).addAll(opToolInputs).build();
@@ -90,6 +102,10 @@ public class WorkerInputs {
     return input.getDigest();
   }
 
+  public long sizeFor(Path inputPath) {
+    return inputSizes.getOrDefault(inputPath, 0L);
+  }
+
   public static WorkerInputs from(WorkFilesContext workFilesContext, List<String> reqArgs) {
     ImmutableMap<Path, Input> pathInputs = workFilesContext.getPathInputs();
 
@@ -112,6 +128,11 @@ public class WorkerInputs {
 
     log.fine(inputsDebugMsg);
 
-    return new WorkerInputs(workFilesContext.opRoot, absToolInputs, toolInputs, pathInputs);
+    return new WorkerInputs(
+        workFilesContext.opRoot,
+        absToolInputs,
+        toolInputs,
+        pathInputs,
+        workFilesContext.getPathInputSizes());
   }
 }

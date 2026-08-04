@@ -23,6 +23,7 @@ import com.google.protobuf.util.Durations;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -32,6 +33,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import lombok.extern.java.Log;
+import org.apache.commons.pool2.PooledObject;
 import persistent.bazel.client.CommonsWorkerPool;
 import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkCoordinator;
@@ -111,7 +113,13 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             Path keyExecRoot = workerKey.getExecRoot();
             String workerExecDir = getUniqueSubdir(keyExecRoot);
             Path workerExecRoot = keyExecRoot.resolve(workerExecDir);
-            copyToolsIntoWorkerExecRoot(workerKey, workerExecRoot);
+            long toolSetupStarted = PersistentWorkerMetrics.startTimer();
+            try {
+              copyToolsIntoWorkerExecRoot(workerKey, workerExecRoot);
+            } finally {
+              PersistentWorkerMetrics.observePhase(
+                  PersistentWorkerMetrics.PHASE_TOOL_SETUP, toolSetupStarted);
+            }
 
             Path initArgsLogFile = workerExecRoot.resolve(workerExecDir + WORKER_INIT_LOG_SUFFIX);
             if (!Files.exists(initArgsLogFile)) {
@@ -125,16 +133,146 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
               Files.write(initArgsLogFile, initArgs.toString().getBytes());
             }
-            return new PersistentWorker(workerKey, workerExecDir);
+            long workerStartStarted = PersistentWorkerMetrics.startTimer();
+            try {
+              PersistentWorker worker = new PersistentWorker(workerKey, workerExecDir);
+              PersistentWorkerMetrics.workerStarted(worker);
+              return worker;
+            } finally {
+              PersistentWorkerMetrics.observePhase(
+                  PersistentWorkerMetrics.PHASE_WORKER_START, workerStartStarted);
+            }
+          }
+
+          @Override
+          public boolean validateObject(WorkerKey key, PooledObject<PersistentWorker> pooled) {
+            boolean valid = super.validateObject(key, pooled);
+            if (!valid) {
+              PersistentWorkerMetrics.markDestroyReason(
+                  pooled.getObject(), PersistentWorkerMetrics.DESTROY_UNEXPECTED_EXIT);
+            }
+            return valid;
+          }
+
+          @Override
+          public void destroyObject(WorkerKey key, PooledObject<PersistentWorker> pooled) {
+            try {
+              super.destroyObject(key, pooled);
+            } finally {
+              PersistentWorkerMetrics.workerDestroyed(pooled.getObject());
+            }
           }
         };
     return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey);
+  }
+
+  @Override
+  public ResponseCtx runRequest(WorkerKey workerKey, RequestCtx request) throws Exception {
+    PersistentWorkerMetrics.requestStarted();
+    try {
+      return runRequestTimed(workerKey, request);
+    } finally {
+      PersistentWorkerMetrics.observeRequest(request.outcome(), request.metricsStartedNanos);
+      PersistentWorkerMetrics.requestFinished();
+    }
+  }
+
+  private ResponseCtx runRequestTimed(WorkerKey workerKey, RequestCtx request) throws Exception {
+    PersistentWorker worker;
+    long poolWaitStarted = PersistentWorkerMetrics.startTimer();
+    PersistentWorkerMetrics.poolWaitStarted();
+    try {
+      worker = workerPool.obtain(workerKey);
+    } catch (Exception e) {
+      if (e instanceof InterruptedException) {
+        request.setOutcome(PersistentWorkerMetrics.OUTCOME_INTERRUPTED);
+      } else if (hasCause(e, NoSuchElementException.class)) {
+        request.setOutcome(PersistentWorkerMetrics.OUTCOME_POOL_TIMEOUT);
+      } else {
+        request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
+      }
+      throw e;
+    } finally {
+      PersistentWorkerMetrics.observePhase(
+          PersistentWorkerMetrics.PHASE_POOL_WAIT, poolWaitStarted);
+      PersistentWorkerMetrics.poolWaitFinished();
+    }
+
+    PersistentWorkerMetrics.workerBorrowed(worker);
+    boolean postWorkCleanupCalled = false;
+    try {
+      request.setOutcome(PersistentWorkerMetrics.OUTCOME_INPUT_SETUP_FAILURE);
+      WorkRequest workRequest = preWorkInit(workerKey, request, worker);
+
+      request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
+      WorkResponse workResponse;
+      long executionStarted = PersistentWorkerMetrics.startTimer();
+      try {
+        workResponse = worker.doWork(workRequest);
+      } finally {
+        PersistentWorkerMetrics.observePhase(
+            PersistentWorkerMetrics.PHASE_WORKER_EXECUTION, executionStarted);
+      }
+
+      request.setOutcome(PersistentWorkerMetrics.OUTCOME_OUTPUT_CLEANUP_FAILURE);
+      postWorkCleanupCalled = true;
+      ResponseCtx responseAfterCleanup = postWorkCleanup(workResponse, worker, request);
+
+      request.setOutcome(
+          workResponse.getExitCode() == 0
+              ? PersistentWorkerMetrics.OUTCOME_SUCCESS
+              : PersistentWorkerMetrics.OUTCOME_ACTION_FAILURE);
+      String completedOutcome = request.outcome();
+      request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
+      workerPool.release(workerKey, worker);
+      PersistentWorkerMetrics.workerReturned(worker);
+      request.setOutcome(completedOutcome);
+      return responseAfterCleanup;
+    } catch (Exception e) {
+      if (e instanceof InterruptedException) {
+        request.setOutcome(PersistentWorkerMetrics.OUTCOME_INTERRUPTED);
+      } else if (request.timedOut()) {
+        request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_TIMEOUT);
+      }
+      if (!postWorkCleanupCalled) {
+        try {
+          postWorkCleanup(null, worker, request);
+        } catch (Exception cleanupEx) {
+          e.addSuppressed(cleanupEx);
+        }
+      }
+      PersistentWorkerMetrics.markDestroyReason(
+          worker,
+          request.timedOut()
+              ? PersistentWorkerMetrics.DESTROY_TIMEOUT
+              : PersistentWorkerMetrics.DESTROY_REQUEST_FAILURE);
+      try {
+        workerPool.invalidate(workerKey, worker);
+      } catch (Exception invalidateEx) {
+        // The timeout handler may already have invalidated this worker.
+        e.addSuppressed(invalidateEx);
+        worker.destroy();
+        PersistentWorkerMetrics.workerDestroyed(worker);
+      }
+      throw e;
+    }
+  }
+
+  private static boolean hasCause(Throwable error, Class<? extends Throwable> causeClass) {
+    for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+      if (causeClass.isInstance(cause)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public void copyToolInputsIntoWorkerToolRoot(WorkerKey key, WorkerInputs workerFiles)
       throws IOException {
     WorkerKey lock = keyLock(key);
     synchronized (lock) {
+      long copiedFiles = 0;
+      long copiedBytes = 0;
       try {
         // Copy tool inputs as needed
         Path workToolRoot = key.getToolRoot();
@@ -142,9 +280,13 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
           Path workToolPath = workerFiles.relativizeInput(workToolRoot, opToolPath);
           if (!Files.exists(workToolPath)) {
             workerFiles.copyInputFile(opToolPath, workToolPath);
+            copiedFiles++;
+            copiedBytes += workerFiles.sizeFor(opToolPath);
           }
         }
       } finally {
+        PersistentWorkerMetrics.recordInputs(
+            PersistentWorkerMetrics.METHOD_TOOL_COPY, copiedFiles, copiedBytes);
         toolInputSyncs.remove(key);
       }
     }
@@ -164,12 +306,18 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     log.log(Level.FINE, "loadToolsIntoWorkerRoot() into: " + workerExecRoot);
 
     Path toolInputRoot = key.getToolRoot();
+    long copiedFiles = 0;
+    long copiedBytes = 0;
     for (Path relPath : key.getWorkerFilesWithHashes().keySet()) {
       Path toolInputPath = toolInputRoot.resolve(relPath);
       Path execRootPath = workerExecRoot.resolve(relPath);
 
       FileAccessUtils.copyFile(toolInputPath, execRootPath);
+      copiedFiles++;
+      copiedBytes += Files.size(toolInputPath);
     }
+    PersistentWorkerMetrics.recordInputs(
+        PersistentWorkerMetrics.METHOD_TOOL_COPY, copiedFiles, copiedBytes);
   }
 
   @Override
@@ -195,7 +343,13 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
               task, Durations.toMillis(request.timeout), TimeUnit.MILLISECONDS);
 
       // Symlinking should hypothetically be faster+leaner than copying inputs, but it's buggy.
-      copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+      long inputSetupStarted = PersistentWorkerMetrics.startTimer();
+      try {
+        copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+      } finally {
+        PersistentWorkerMetrics.observePhase(
+            PersistentWorkerMetrics.PHASE_INPUT_SETUP, inputSetupStarted);
+      }
     } catch (Exception e) {
       pendingReqs.remove(request);
       if (task.future != null) {
@@ -228,8 +382,22 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       Path workerExecRoot = worker.getExecRoot();
       // Always move outputs and clean up non-tool inputs, regardless of exit code. This matches the
       // REAPI spec as well as what Buildfarm and Bazel do elsewhere.
-      moveOutputsToOperationRoot(request.filesContext, workerExecRoot);
-      cleanUpNontoolInputs(request.workerInputs, workerExecRoot);
+      long outputMoveStarted = PersistentWorkerMetrics.startTimer();
+      request.setOutcome(PersistentWorkerMetrics.OUTCOME_OUTPUT_CLEANUP_FAILURE);
+      try {
+        moveOutputsToOperationRoot(request.filesContext, workerExecRoot);
+      } finally {
+        PersistentWorkerMetrics.observePhase(
+            PersistentWorkerMetrics.PHASE_OUTPUT_MOVE, outputMoveStarted);
+      }
+      long inputCleanupStarted = PersistentWorkerMetrics.startTimer();
+      request.setOutcome(PersistentWorkerMetrics.OUTCOME_INPUT_CLEANUP_FAILURE);
+      try {
+        cleanUpNontoolInputs(request.workerInputs, workerExecRoot);
+      } finally {
+        PersistentWorkerMetrics.observePhase(
+            PersistentWorkerMetrics.PHASE_INPUT_CLEANUP, inputCleanupStarted);
+      }
     } catch (IOException e) {
       throw logBadCleanup(request, e);
     }
@@ -257,12 +425,18 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
   private void copyNontoolInputs(WorkerInputs workerInputs, Path workerExecRoot)
       throws IOException {
+    long copiedFiles = 0;
+    long copiedBytes = 0;
     for (Path opPath : workerInputs.allInputs.keySet()) {
       if (!workerInputs.allToolInputs.contains(opPath)) {
         Path execPath = workerInputs.relativizeInput(workerExecRoot, opPath);
         workerInputs.copyInputFile(opPath, execPath);
+        copiedFiles++;
+        copiedBytes += workerInputs.sizeFor(opPath);
       }
     }
+    PersistentWorkerMetrics.recordInputs(
+        PersistentWorkerMetrics.METHOD_COPY, copiedFiles, copiedBytes);
   }
 
   // Make outputs visible to the rest of Worker machinery
@@ -339,9 +513,12 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   }
 
   private void onTimeout(RequestCtx request, PersistentWorker worker) {
+    request.markTimedOut();
     if (worker != null) {
       log.severe("Persistent Worker timed out on request: " + request.request);
       try {
+        PersistentWorkerMetrics.markDestroyReason(
+            worker, PersistentWorkerMetrics.DESTROY_TIMEOUT);
         this.workerPool.invalidateObject(worker.getKey(), worker);
       } catch (Exception e) {
         log.severe(
