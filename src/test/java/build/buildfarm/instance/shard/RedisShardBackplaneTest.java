@@ -17,13 +17,17 @@ package build.buildfarm.instance.shard;
 import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.withSettings;
 
+import build.bazel.remote.execution.v2.ExecutionStage;
 import build.bazel.remote.execution.v2.RequestMetadata;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.HashFunction;
@@ -36,13 +40,18 @@ import build.buildfarm.common.redis.ClusterPipeline;
 import build.buildfarm.common.redis.RedisClient;
 import build.buildfarm.common.redis.RedisHashMap;
 import build.buildfarm.common.redis.RedisMap;
+import build.buildfarm.common.redis.Unified;
 import build.buildfarm.instance.shard.ExecutionQueue.ExecutionQueueEntry;
 import build.buildfarm.instance.shard.codec.ShardCodec;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.DispatchedOperation;
+import build.buildfarm.v1test.DispatchedOperationsStatus;
 import build.buildfarm.v1test.ExecuteEntry;
+import build.buildfarm.v1test.LabeledCount;
 import build.buildfarm.v1test.OperationChange;
+import build.buildfarm.v1test.OperationQueueStatus;
 import build.buildfarm.v1test.QueueEntry;
+import build.buildfarm.v1test.QueueStatus;
 import build.buildfarm.v1test.ShardWorker;
 import build.buildfarm.v1test.WorkerChange;
 import build.buildfarm.worker.resources.LocalResourceSet;
@@ -53,6 +62,7 @@ import com.google.longrunning.Operation;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -60,6 +70,7 @@ import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -133,6 +144,165 @@ public class RedisShardBackplaneTest {
 
   String operationName(String name) {
     return "Operation:" + name;
+  }
+
+  private static DispatchedOperation dispatchedOperation(
+      String operationName, String provisionQueueName, long requeueAt) {
+    return DispatchedOperation.newBuilder()
+        .setQueueEntry(
+            QueueEntry.newBuilder()
+                .setExecuteEntry(
+                    ExecuteEntry.newBuilder().setOperationName(operationName).build())
+                .build())
+        .setRequeueAt(requeueAt)
+        .setProvisionQueueName(provisionQueueName)
+        .build();
+  }
+
+  private static Map<String, Long> dispatchedQueueCounts(DispatchedOperationsStatus status) {
+    return status.getFromQueuesList().stream()
+        .collect(Collectors.toMap(LabeledCount::getName, LabeledCount::getSize));
+  }
+
+  @Test
+  public void dispatchedOperationsStatusAttributesArmAndX86WithoutCrossAttribution() {
+    DispatchedOperation arm = dispatchedOperation("arm", "{}arm_priority", 100);
+    DispatchedOperation x86 = dispatchedOperation("x86", "{}x86_priority", 100);
+
+    DispatchedOperationsStatus status =
+        RedisShardBackplane.dispatchedOperationsStatus(
+            ImmutableMap.of("arm", arm, "x86", x86));
+
+    assertThat(status.getSize()).isEqualTo(2);
+    assertThat(dispatchedQueueCounts(status))
+        .containsExactly("{}arm_priority", 1L, "{}x86_priority", 1L);
+  }
+
+  @Test
+  public void dispatchedOperationsStatusCountsMultipleSimultaneousOperations() {
+    DispatchedOperation armOne = dispatchedOperation("arm-one", "{}arm_priority", 100);
+    DispatchedOperation armTwo = dispatchedOperation("arm-two", "{}arm_priority", 100);
+
+    DispatchedOperationsStatus status =
+        RedisShardBackplane.dispatchedOperationsStatus(
+            ImmutableMap.of("arm-one", armOne, "arm-two", armTwo));
+
+    assertThat(status.getSize()).isEqualTo(2);
+    assertThat(dispatchedQueueCounts(status)).containsExactly("{}arm_priority", 2L);
+  }
+
+  @Test
+  public void dispatchedOperationsStatusUsesImmutableQueueAcrossLeaseRefresh() {
+    DispatchedOperation original = dispatchedOperation("arm", "{}arm_priority", 100);
+    DispatchedOperation refreshed = dispatchedOperation("arm", "{}arm_priority", 200);
+    Map<String, DispatchedOperation> dispatched = new HashMap<>();
+    dispatched.put("arm", original);
+
+    DispatchedOperationsStatus beforeRefresh =
+        RedisShardBackplane.dispatchedOperationsStatus(dispatched);
+    dispatched.put("arm", refreshed);
+    DispatchedOperationsStatus afterRefresh =
+        RedisShardBackplane.dispatchedOperationsStatus(dispatched);
+
+    assertThat(beforeRefresh.getSize()).isEqualTo(1);
+    assertThat(afterRefresh.getSize()).isEqualTo(1);
+    assertThat(dispatchedQueueCounts(afterRefresh)).containsExactly("{}arm_priority", 1L);
+  }
+
+  @Test
+  public void pollExecutionRefreshesDispatchedRecordWithoutRemovingIt() throws IOException {
+    UnifiedJedis jedis = mock(UnifiedJedis.class);
+    RedisClient client = new RedisClient(jedis);
+    DistributedState state = new DistributedState();
+    state.dispatchedExecutions = mock(RedisHashMap.class);
+    RedisShardBackplane backplane = createBackplane("poll-execution-refresh-test");
+    backplane.start(client, state, "startTime/test:0000", name -> {});
+    DispatchedOperation existing = dispatchedOperation("arm", "{}arm_priority", 100);
+    QueueEntry queueEntry = existing.getQueueEntry();
+    DispatchedOperation refreshed =
+        existing.toBuilder().setQueueEntry(queueEntry).setRequeueAt(200).build();
+    when(state.dispatchedExecutions.get(jedis, "arm")).thenReturn(existing);
+    when(state.dispatchedExecutions.insert(jedis, "arm", refreshed)).thenReturn(false);
+
+    assertThat(backplane.pollExecution(queueEntry, ExecutionStage.Value.EXECUTING, 200)).isTrue();
+
+    verify(state.dispatchedExecutions).get(jedis, "arm");
+    verify(state.dispatchedExecutions).insert(jedis, "arm", refreshed);
+    verifyNoMoreInteractions(state.dispatchedExecutions);
+  }
+
+  @Test
+  public void dispatchedOperationsStatusDropsCompletedOperation() {
+    DispatchedOperation arm = dispatchedOperation("arm", "{}arm_priority", 100);
+    Map<String, DispatchedOperation> dispatched = new HashMap<>();
+    dispatched.put("arm", arm);
+    assertThat(
+            RedisShardBackplane.dispatchedOperationsStatus(dispatched).getSize())
+        .isEqualTo(1);
+
+    dispatched.remove("arm");
+    DispatchedOperationsStatus completed =
+        RedisShardBackplane.dispatchedOperationsStatus(dispatched);
+
+    assertThat(completed.getSize()).isEqualTo(0);
+    assertThat(completed.getFromQueuesList()).isEmpty();
+  }
+
+  @Test
+  public void dispatchedOperationsStatusRetainsUnmatchedOperationOnlyInTotal() {
+    DispatchedOperation arm = dispatchedOperation("arm", "{}arm_priority", 100);
+    DispatchedOperation unmatched = dispatchedOperation("unmatched", "", 100);
+
+    DispatchedOperationsStatus status =
+        RedisShardBackplane.dispatchedOperationsStatus(
+            ImmutableMap.of("arm", arm, "unmatched", unmatched));
+
+    assertThat(status.getSize()).isEqualTo(2);
+    assertThat(dispatchedQueueCounts(status)).containsExactly("{}arm_priority", 1L);
+  }
+
+  @Test
+  public void backplaneStatusReportsCanonicalDispatchedQueuesAndLegacyTotal() throws IOException {
+    UnifiedJedis jedis =
+        mock(UnifiedJedis.class, withSettings().extraInterfaces(Unified.class));
+    AbstractPipeline pipeline = mock(AbstractPipeline.class);
+    when(((Unified) jedis).pipelined(any(Executor.class))).thenReturn(pipeline);
+    RedisClient client = new RedisClient(jedis);
+    DistributedState state = new DistributedState();
+    state.executeWorkers = mock(RedisHashMap.class);
+    state.storageWorkers = mock(RedisHashMap.class);
+    state.dispatchedExecutions = mock(RedisHashMap.class);
+    state.prequeue = mock(BalancedRedisQueue.class);
+    state.executionQueue = spy(new ExecutionQueue(ImmutableList.of()));
+    when(state.executeWorkers.asMap(jedis)).thenReturn(ImmutableMap.of());
+    when(state.storageWorkers.asMap(jedis)).thenReturn(ImmutableMap.of());
+    DispatchedOperation arm = dispatchedOperation("arm", "{}arm_priority", 100);
+    DispatchedOperation x86 = dispatchedOperation("x86", "{}x86_priority", 100);
+    DispatchedOperation unmatched = dispatchedOperation("unmatched", "", 100);
+    when(state.dispatchedExecutions.asMap(jedis))
+        .thenReturn(ImmutableMap.of("arm", arm, "x86", x86, "unmatched", unmatched));
+    when(state.prequeue.status(pipeline))
+        .thenReturn(() -> QueueStatus.newBuilder().setSize(0).build());
+    doReturn(
+            (Supplier<OperationQueueStatus>)
+                () ->
+                    OperationQueueStatus.newBuilder()
+                        .addProvisions(
+                            QueueStatus.newBuilder().setName("{}arm_priority").build())
+                        .addProvisions(
+                            QueueStatus.newBuilder().setName("{}x86_priority").build())
+                        .build())
+        .when(state.executionQueue)
+        .status(pipeline);
+    RedisShardBackplane backplane = createBackplane("dispatched-status-contract-test");
+    backplane.start(client, state, "startTime/test:0000", name -> {});
+
+    build.buildfarm.v1test.BackplaneStatus status = backplane.backplaneStatus();
+
+    assertThat(status.getDispatchedSize()).isEqualTo(3);
+    assertThat(status.getDispatchedOperations().getSize()).isEqualTo(3);
+    assertThat(dispatchedQueueCounts(status.getDispatchedOperations()))
+        .containsExactly("{}arm_priority", 1L, "{}x86_priority", 1L);
   }
 
   @Test
@@ -241,6 +411,7 @@ public class RedisShardBackplaneTest {
             .setRequeueAttempts(STARTING_REQUEUE_AMOUNT)
             .build();
     BalancedRedisQueue subQueue = mock(BalancedRedisQueue.class);
+    when(subQueue.getStatusName()).thenReturn("{}selected_queue");
     BalancedQueueEntry<QueueEntry> balancedQueueEntry = new BalancedQueueEntry<>(null, queueEntry);
     ExecutionQueueEntry executionQueueEntry = new ExecutionQueueEntry(subQueue, balancedQueueEntry);
     when(state.executionQueue.dequeue(
@@ -258,6 +429,7 @@ public class RedisShardBackplaneTest {
 
               assertThat(dispatchedOperation.getQueueEntry().getRequeueAttempts())
                   .isEqualTo(REQUEUE_AMOUNT_WHEN_DISPATCHED);
+              assertThat(dispatchedOperation.getProvisionQueueName()).isEqualTo("{}selected_queue");
 
               return true;
             });
@@ -323,6 +495,7 @@ public class RedisShardBackplaneTest {
             .setRequeueAttempts(STARTING_REQUEUE_AMOUNT)
             .build();
     BalancedRedisQueue subQueue = mock(BalancedRedisQueue.class);
+    when(subQueue.getStatusName()).thenReturn("{}selected_queue");
     BalancedQueueEntry<QueueEntry> balancedQueueEntry = new BalancedQueueEntry<>(null, queueEntry);
     ExecutionQueueEntry executionQueueEntry = new ExecutionQueueEntry(subQueue, balancedQueueEntry);
     when(state.executionQueue.dequeue(
@@ -340,6 +513,7 @@ public class RedisShardBackplaneTest {
 
               assertThat(dispatchedOperation.getQueueEntry().getRequeueAttempts())
                   .isEqualTo(REQUEUE_AMOUNT_WHEN_DISPATCHED);
+              assertThat(dispatchedOperation.getProvisionQueueName()).isEqualTo("{}selected_queue");
 
               return true;
             });
