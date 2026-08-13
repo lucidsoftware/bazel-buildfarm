@@ -38,13 +38,13 @@ import build.buildfarm.common.Write.NullWrite;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.config.ExecutionPolicy;
 import build.buildfarm.common.config.ExecutionWrapper;
-import build.buildfarm.v1test.Tree;
 import build.buildfarm.worker.WorkerContext.IOResource;
 import build.buildfarm.worker.persistent.PersistentExecutor;
 import build.buildfarm.worker.persistent.WorkFilesContext;
 import build.buildfarm.worker.resources.ResourceLimits;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.core.DockerClientBuilder;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -59,6 +59,7 @@ import com.google.protobuf.util.Durations;
 import com.google.protobuf.util.Timestamps;
 import com.google.rpc.Code;
 import io.grpc.Deadline;
+import io.prometheus.client.Counter;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -72,11 +73,27 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.logging.Level;
+import javax.annotation.Nullable;
 import lombok.extern.java.Log;
 
 @Log
 class Executor {
   private static final int INCOMPLETE_EXIT_CODE = -1;
+  private static final String PERSISTENT_WORKER_ELIGIBLE = "eligible";
+  private static final String PERSISTENT_WORKER_MNEMONIC_REJECTED = "mnemonic_rejected";
+  private static final String PERSISTENT_WORKER_UNMARKED_EXECUTABLE = "unmarked_executable";
+  private static final Counter persistentWorkerEligibility =
+      Counter.build()
+          .name("persistent_worker_eligibility_total")
+          .labelNames("outcome")
+          .help("Persistent-worker eligibility decisions by bounded outcome.")
+          .register();
+
+  static {
+    persistentWorkerEligibility.labels(PERSISTENT_WORKER_ELIGIBLE);
+    persistentWorkerEligibility.labels(PERSISTENT_WORKER_MNEMONIC_REJECTED);
+    persistentWorkerEligibility.labels(PERSISTENT_WORKER_UNMARKED_EXECUTABLE);
+  }
 
   private final WorkerContext workerContext;
   private final ExecutionContext executionContext;
@@ -309,6 +326,8 @@ class Executor {
     }
 
     Code statusCode;
+    WorkFilesContext persistentWorkerFilesContext = getPersistentWorkerFilesContext();
+    boolean usePersistentWorker = persistentWorkerFilesContext != null;
     try (IOResource resource =
         workerContext.limitExecution(
             operationName,
@@ -316,7 +335,7 @@ class Executor {
             arguments,
             executionContext.command,
             workingDirectory,
-            shouldRunOnPersistentWorker(limits))) {
+            usePersistentWorker)) {
       // Apply all other custom execution policies AFTER built-in wrappers
       for (ExecutionPolicy policy : policies) {
         if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
@@ -345,6 +364,7 @@ class Executor {
               arguments.build(),
               command.getEnvironmentVariablesList(),
               limits,
+              persistentWorkerFilesContext,
               timeout,
               // executingMetadata.getStdoutStreamName(),
               // executingMetadata.getStderrStreamName(),
@@ -485,22 +505,53 @@ class Executor {
    * Decide if this action should run on a Persistent Worker. <br>
    *
    * <ul>
-   *   <li>The Persistent worker key must be set. This is set by bazel client with
-   *       "--experimental_remote_mark_tool_inputs"
-   *   <li>the config.yaml has to have a "*" OR have the mnemonic allowlisted.
+   *   <li>The config.yaml has to have a "*" or have the mnemonic allowlisted.
+   *   <li>The command executable must be marked as a tool input. Bazel sets these node properties
+   *       with "--experimental_remote_mark_tool_inputs".
    * </ul>
    *
-   * @return <c>true</c> if the action should be sent to a persistent worker, <c>false</c>
-   *     otherwise.
+   * <p>The persistent executor derives its process key from the marked tool inputs themselves. It
+   * does not need the nonstandard persistentWorkerKey platform property as an additional gate.
+   *
+   * @return the indexed work files if the action should use a persistent worker, otherwise null.
    */
-  private boolean shouldRunOnPersistentWorker(ResourceLimits limits) {
-    if (!limits.persistentWorkerKey.isEmpty()) {
-      Collection<String> mnemonicAllowlist =
-          BuildfarmConfigs.getInstance().getWorker().getPersistentWorkerActionMnemonicAllowlist();
-      String actionMnemonic = executionContext.metadata.getRequestMetadata().getActionMnemonic();
-      return mnemonicAllowlist.contains("*") || mnemonicAllowlist.contains(actionMnemonic);
+  @Nullable
+  private WorkFilesContext getPersistentWorkerFilesContext() {
+    Collection<String> mnemonicAllowlist =
+        BuildfarmConfigs.getInstance().getWorker().getPersistentWorkerActionMnemonicAllowlist();
+    String actionMnemonic = executionContext.metadata.getRequestMetadata().getActionMnemonic();
+    if (!isPersistentWorkerEligible(actionMnemonic, mnemonicAllowlist, true)) {
+      persistentWorkerEligibility.labels(PERSISTENT_WORKER_MNEMONIC_REJECTED).inc();
+      return null;
     }
-    return false;
+
+    WorkFilesContext filesContext =
+        WorkFilesContext.fromContext(
+            executionContext.execDir, executionContext.tree, executionContext.command);
+    boolean executableIsTool = false;
+    if (executionContext.command.getArgumentsCount() > 0) {
+      Path executable = Path.of(executionContext.command.getArguments(0));
+      executableIsTool =
+          filesContext
+              .getToolInputs()
+              .containsKey(executionContext.execDir.resolve(executable).normalize());
+    }
+    if (!isPersistentWorkerEligible(actionMnemonic, mnemonicAllowlist, executableIsTool)) {
+      persistentWorkerEligibility.labels(PERSISTENT_WORKER_UNMARKED_EXECUTABLE).inc();
+      return null;
+    }
+
+    persistentWorkerEligibility.labels(PERSISTENT_WORKER_ELIGIBLE).inc();
+    return filesContext;
+  }
+
+  @VisibleForTesting
+  static boolean isPersistentWorkerEligible(
+      String actionMnemonic,
+      Collection<String> mnemonicAllowlist,
+      boolean executableIsTool) {
+    return executableIsTool
+        && (mnemonicAllowlist.contains("*") || mnemonicAllowlist.contains(actionMnemonic));
   }
 
   @SuppressWarnings("ConstantConditions")
@@ -510,6 +561,7 @@ class Executor {
       List<String> arguments,
       List<EnvironmentVariable> environmentVariables,
       ResourceLimits limits,
+      @Nullable WorkFilesContext persistentWorkerFilesContext,
       Duration timeout,
       ActionResult.Builder resultBuilder)
       throws IOException, InterruptedException {
@@ -527,20 +579,15 @@ class Executor {
     if (limits.debugBeforeExecution) {
       return ExecutionDebugger.performBeforeExecutionDebug(processBuilder, limits, resultBuilder);
     }
-    if (shouldRunOnPersistentWorker(limits)) {
+    if (persistentWorkerFilesContext != null) {
       // RBE Client suggests to run this Action as persistent...
       log.fine(
           "usePersistentWorker (mnemonic="
               + executionContext.metadata.getRequestMetadata().getActionMnemonic()
               + ")");
 
-      Tree execTree = executionContext.tree;
-
-      WorkFilesContext filesContext =
-          WorkFilesContext.fromContext(execDir, execTree, executionContext.command);
-
       return PersistentExecutor.runOnPersistentWorker(
-          filesContext,
+          persistentWorkerFilesContext,
           operationName,
           ImmutableList.copyOf(arguments),
           ImmutableMap.copyOf(environment),

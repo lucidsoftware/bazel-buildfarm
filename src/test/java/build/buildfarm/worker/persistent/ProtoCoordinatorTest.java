@@ -17,6 +17,8 @@ package build.buildfarm.worker.persistent;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import build.bazel.remote.execution.v2.Command;
@@ -47,6 +49,7 @@ import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import persistent.bazel.client.CommonsWorkerPool;
 import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkerKey;
 
@@ -63,7 +66,7 @@ public class ProtoCoordinatorTest {
   @After
   public void shutdownSchedulers() {
     for (ProtoCoordinator protoCoordinator : coordinators) {
-      protoCoordinator.timeoutScheduler.shutdownNow();
+      protoCoordinator.close();
     }
     coordinators.clear();
   }
@@ -279,6 +282,41 @@ public class ProtoCoordinatorTest {
   }
 
   @Test
+  public void staleTimeoutCannotKillWorkerLeasedToNewRequest() throws Exception {
+    CommonsWorkerPool workerPool = mock(CommonsWorkerPool.class);
+    ProtoCoordinator protoCoordinator = new ProtoCoordinator(workerPool);
+    coordinators.add(protoCoordinator);
+    PersistentWorker worker = mock(PersistentWorker.class);
+    protoCoordinator.lifecycle.register(worker);
+    PersistentWorkerLifecycle.Lease first = protoCoordinator.lifecycle.lease(worker, "operation-1");
+    assertThat(protoCoordinator.lifecycle.release(first)).isTrue();
+    PersistentWorkerLifecycle.Lease second =
+        protoCoordinator.lifecycle.lease(worker, "operation-2");
+    RequestCtx request = createRequestDontAddToPendingRequests();
+
+    protoCoordinator.onTimeout(request, first);
+
+    verify(workerPool, never())
+        .invalidateObject(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+    PersistentWorkerLifecycle.Snapshot snapshot =
+        protoCoordinator.lifecycle.snapshot(worker).orElseThrow();
+    assertThat(snapshot.state()).isEqualTo(PersistentWorkerLifecycle.State.LEASED);
+    assertThat(snapshot.generation()).isEqualTo(second.generation());
+    assertThat(request.timedOut()).isFalse();
+  }
+
+  @Test
+  public void closeShutsDownPoolAndTimeoutScheduler() {
+    CommonsWorkerPool workerPool = mock(CommonsWorkerPool.class);
+    ProtoCoordinator protoCoordinator = new ProtoCoordinator(workerPool);
+
+    protoCoordinator.close();
+
+    verify(workerPool).close();
+    assertThat(protoCoordinator.timeoutScheduler.isShutdown()).isTrue();
+  }
+
+  @Test
   public void preWorkInit_cleansUpPendingReqsOnCopyFailure() throws Exception {
     ProtoCoordinator protoCoordinator = newCoordinator();
 
@@ -305,11 +343,15 @@ public class ProtoCoordinatorTest {
     when(mockWorker.getExecRoot()).thenReturn(fsRoot.resolve("workerExecRoot"));
 
     // Make sure that we actually caused the error we wanted to.
-    assertThrows(IOException.class, () -> protoCoordinator.preWorkInit(null, request, mockWorker));
+    protoCoordinator.lifecycle.register(mockWorker);
+    PersistentWorkerLifecycle.Lease lease =
+        protoCoordinator.lifecycle.lease(mockWorker, "copy-failure");
+    assertThrows(
+        IOException.class, () -> protoCoordinator.preWorkInit(null, request, mockWorker, lease));
 
     // Make sure that, despite the error, the request is cleaned up from the map of pending
     // requests
-    assertThat(ProtoCoordinator.hasPendingRequest(request)).isFalse();
+    assertThat(protoCoordinator.hasPendingRequest(request)).isFalse();
   }
 
   @Test

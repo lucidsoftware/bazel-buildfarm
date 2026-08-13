@@ -17,6 +17,8 @@ package build.buildfarm.worker.persistent;
 import static java.lang.String.join;
 
 import build.bazel.remote.execution.v2.ActionResult;
+import build.buildfarm.common.config.BuildfarmConfigs;
+import build.buildfarm.common.config.PersistentWorkers;
 import build.buildfarm.worker.resources.ResourceLimits;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
@@ -46,8 +48,8 @@ import persistent.bazel.client.WorkerKey;
  */
 @Log
 public class PersistentExecutor {
-  private static final ProtoCoordinator coordinator =
-      ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey());
+  private static ProtoCoordinator coordinator;
+  private static boolean shutDown;
 
   // TODO load from config (i.e. {worker_root}/persistent)
   public static final Path defaultWorkRootsDir = Path.of("/tmp/worker/persistent/");
@@ -61,20 +63,38 @@ public class PersistentExecutor {
   private static final String SCALAC_EXEC_NAME = "Scalac";
   private static final String JAVAC_EXEC_NAME = "JavaBuilder";
 
-  // How many workers can exist at once for a given WorkerKey
-  // There may be multiple WorkerKeys per mnemonic,
-  //  e.g. if builds are run with different tool fingerprints
-  private static final int defaultMaxWorkersPerKey = 6;
+  private static ProtoCoordinator createCoordinator() {
+    PersistentWorkers settings = BuildfarmConfigs.getInstance().getWorker().getPersistentWorkers();
+    return ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey(settings), settings);
+  }
 
-  private static int getMaxWorkersPerKey() {
+  private static synchronized ProtoCoordinator getCoordinator() {
+    if (shutDown) {
+      throw new IllegalStateException("persistent worker executor has been shut down");
+    }
+    if (coordinator == null) {
+      coordinator = createCoordinator();
+    }
+    return coordinator;
+  }
+
+  public static synchronized void shutdown() {
+    shutDown = true;
+    if (coordinator != null) {
+      coordinator.close();
+      coordinator = null;
+    }
+  }
+
+  private static int getMaxWorkersPerKey(PersistentWorkers settings) {
     try {
       return Integer.parseInt(System.getenv("BUILDFARM_MAX_WORKERS_PER_KEY"));
     } catch (Exception ignored) {
       log.info(
           "Could not get env var BUILDFARM_MAX_WORKERS_PER_KEY; defaulting to "
-              + defaultMaxWorkersPerKey);
+              + settings.getMaxWorkersPerKey());
     }
-    return defaultMaxWorkersPerKey;
+    return settings.getMaxWorkersPerKey();
   }
 
   /**
@@ -140,6 +160,7 @@ public class PersistentExecutor {
     // Make Key
 
     WorkerInputs workerFiles = WorkerInputs.from(context, requestArgs);
+    ProtoCoordinator requestCoordinator = getCoordinator();
 
     Path binary = Path.of(workerExecCmd.getFirst());
     if (!workerFiles.containsTool(binary) && !binary.isAbsolute()) {
@@ -160,7 +181,7 @@ public class PersistentExecutor {
     long persistentWorkerRequestStarted = PersistentWorkerMetrics.startTimer();
     long toolSetupStarted = PersistentWorkerMetrics.startTimer();
     try {
-      coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
+      requestCoordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
     } catch (IOException | RuntimeException e) {
       PersistentWorkerMetrics.observeRequest(
           PersistentWorkerMetrics.OUTCOME_TOOL_SETUP_FAILURE, persistentWorkerRequestStarted);
@@ -194,8 +215,7 @@ public class PersistentExecutor {
             .build();
 
     RequestCtx requestCtx =
-        new RequestCtx(
-            request, context, workerFiles, timeout, persistentWorkerRequestStarted);
+        new RequestCtx(request, context, workerFiles, timeout, persistentWorkerRequestStarted);
 
     // Run request
     // Required file operations (in/out) are the responsibility of the coordinator
@@ -204,7 +224,7 @@ public class PersistentExecutor {
     WorkResponse response;
     String stdErr = "";
     try {
-      ResponseCtx fullResponse = coordinator.runRequest(key, requestCtx);
+      ResponseCtx fullResponse = requestCoordinator.runRequest(key, requestCtx);
 
       response = fullResponse.response;
       stdErr = fullResponse.errorString;

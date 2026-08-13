@@ -14,8 +14,12 @@
 
 package build.buildfarm.worker.persistent;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
 
+import build.buildfarm.common.config.PersistentWorkers;
+import build.buildfarm.common.io.Directories;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
@@ -23,6 +27,7 @@ import com.google.protobuf.util.Durations;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
@@ -50,21 +55,25 @@ import persistent.bazel.client.WorkerSupervisor;
  * </ol>
  */
 @Log
-public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool> {
+public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool>
+    implements AutoCloseable {
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
 
-  private record PendingRequest(PersistentWorker worker, RequestTimeoutHandler task) {
+  @VisibleForTesting final PersistentWorkerLifecycle lifecycle;
+  private final PersistentWorkerIdleMonitor idleMonitor;
+
+  private record PendingRequest(PersistentWorkerLifecycle.Lease lease, RequestTimeoutHandler task) {
     private PendingRequest {
-      Objects.requireNonNull(worker);
+      Objects.requireNonNull(lease);
       Objects.requireNonNull(task);
     }
   }
 
-  private static final ConcurrentHashMap<RequestCtx, PendingRequest> pendingReqs =
+  private final ConcurrentHashMap<RequestCtx, PendingRequest> pendingReqs =
       new ConcurrentHashMap<>();
 
   @VisibleForTesting
-  static boolean hasPendingRequest(RequestCtx request) {
+  boolean hasPendingRequest(RequestCtx request) {
     return pendingReqs.containsKey(request);
   }
 
@@ -95,10 +104,31 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
   public ProtoCoordinator(CommonsWorkerPool workerPool) {
     super(workerPool);
+    lifecycle = new PersistentWorkerLifecycle();
+    idleMonitor = PersistentWorkerIdleMonitor.disabled(lifecycle);
   }
 
-  private ProtoCoordinator(WorkerSupervisor supervisor, int maxWorkersPerKey) {
-    super(new CommonsWorkerPool(supervisor, maxWorkersPerKey));
+  private ProtoCoordinator(
+      WorkerSupervisor supervisor,
+      int maxWorkersPerKey,
+      PersistentWorkers settings,
+      PersistentWorkerLifecycle lifecycle,
+      PersistentWorkerIdleMonitor idleMonitor) {
+    super(
+        new CommonsWorkerPool(
+            supervisor,
+            maxWorkersPerKey,
+            settings.getMaxWorkersTotal(),
+            settings.getWarmIdleWorkersPerKey(),
+            settings.getIdleRetirementMode() == PersistentWorkers.IdleRetirementMode.ENABLED
+                ? Duration.ofSeconds(settings.getIdleCheckIntervalSeconds())
+                : Duration.ofMillis(-1),
+            new PersistentWorkerEvictionPolicy(
+                lifecycle,
+                Duration.ofSeconds(settings.getIdleTimeoutSeconds()),
+                settings.getWarmIdleWorkersPerKey())));
+    this.lifecycle = lifecycle;
+    this.idleMonitor = idleMonitor;
   }
 
   // We copy tool inputs from the shared WorkerKey tools directory into our worker exec root,
@@ -106,6 +136,13 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   //    and presumably there might be writes to tool inputs?
   // Tool inputs which are absolute-paths (e.g. /usr/bin/...) are not affected
   public static ProtoCoordinator ofCommonsPool(int maxWorkersPerKey) {
+    return ofCommonsPool(maxWorkersPerKey, new PersistentWorkers());
+  }
+
+  public static ProtoCoordinator ofCommonsPool(int maxWorkersPerKey, PersistentWorkers settings) {
+    validateSettings(maxWorkersPerKey, settings);
+    PersistentWorkerLifecycle lifecycle = new PersistentWorkerLifecycle();
+    PersistentWorkerIdleMonitor idleMonitor = PersistentWorkerIdleMonitor.from(settings, lifecycle);
     WorkerSupervisor loadToolsOnCreate =
         new WorkerSupervisor() {
           @Override
@@ -136,6 +173,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             long workerStartStarted = PersistentWorkerMetrics.startTimer();
             try {
               PersistentWorker worker = new PersistentWorker(workerKey, workerExecDir);
+              lifecycle.register(worker);
+              idleMonitor.onIdle(worker);
               PersistentWorkerMetrics.workerStarted(worker);
               return worker;
             } finally {
@@ -156,14 +195,86 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
           @Override
           public void destroyObject(WorkerKey key, PooledObject<PersistentWorker> pooled) {
+            PersistentWorker worker = pooled.getObject();
+            idleMonitor.onUnavailable(worker);
+            lifecycle.beginRetiring(worker);
             try {
-              super.destroyObject(key, pooled);
+              boolean terminated =
+                  worker.terminate(Duration.ofSeconds(settings.getGracefulTerminationSeconds()));
+              if (terminated) {
+                removeWorkerExecRoot(key, worker);
+              } else {
+                PersistentWorkerMetrics.terminationFailure();
+                log.severe(
+                    "Persistent worker process tree did not terminate; preserving exec root: "
+                        + worker.getExecRoot());
+              }
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              worker.destroy();
+              PersistentWorkerMetrics.terminationFailure();
+              log.log(Level.WARNING, "Interrupted while terminating persistent worker", e);
             } finally {
-              PersistentWorkerMetrics.workerDestroyed(pooled.getObject());
+              lifecycle.terminated(worker);
+              PersistentWorkerMetrics.workerDestroyed(worker);
             }
           }
         };
-    return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey);
+    return new ProtoCoordinator(
+        loadToolsOnCreate, maxWorkersPerKey, settings, lifecycle, idleMonitor);
+  }
+
+  private static void validateSettings(int maxWorkersPerKey, PersistentWorkers settings) {
+    checkNotNull(settings);
+    checkNotNull(settings.getIdleRetirementMode());
+    checkArgument(maxWorkersPerKey > 0, "maxWorkersPerKey must be positive");
+    checkArgument(
+        settings.getMaxWorkersTotal() == -1 || settings.getMaxWorkersTotal() > 0,
+        "maxWorkersTotal must be positive or -1");
+    checkArgument(
+        settings.getWarmIdleWorkersPerKey() >= 0
+            && settings.getWarmIdleWorkersPerKey() <= maxWorkersPerKey,
+        "warmIdleWorkersPerKey must be between zero and maxWorkersPerKey");
+    checkArgument(settings.getIdleTimeoutSeconds() > 0, "idleTimeoutSeconds must be positive");
+    if (settings.getIdleRetirementMode() == PersistentWorkers.IdleRetirementMode.ENABLED) {
+      checkArgument(
+          settings.getIdleCheckIntervalSeconds() > 0,
+          "idleCheckIntervalSeconds must be positive when idle retirement is enabled");
+    }
+    checkArgument(
+        settings.getGracefulTerminationSeconds() >= 0,
+        "gracefulTerminationSeconds must not be negative");
+  }
+
+  private static void removeWorkerExecRoot(WorkerKey key, PersistentWorker worker) {
+    Path workerExecRoot = worker.getExecRoot().toAbsolutePath().normalize();
+    Path keyExecRoot = key.getExecRoot().toAbsolutePath().normalize();
+    if (!keyExecRoot.equals(workerExecRoot.getParent())) {
+      log.severe(
+          "Refusing to remove persistent worker exec root outside its key root: " + workerExecRoot);
+      return;
+    }
+    if (!Files.exists(workerExecRoot)) {
+      return;
+    }
+    try {
+      Directories.remove(workerExecRoot, Files.getFileStore(workerExecRoot));
+    } catch (IOException e) {
+      log.log(Level.WARNING, "Could not remove persistent worker exec root " + workerExecRoot, e);
+    }
+  }
+
+  @Override
+  public void close() {
+    idleMonitor.close();
+    for (PendingRequest pendingRequest : pendingReqs.values()) {
+      if (pendingRequest.task().future != null) {
+        pendingRequest.task().future.cancel(false);
+      }
+    }
+    pendingReqs.clear();
+    timeoutScheduler.shutdownNow();
+    workerPool.close();
   }
 
   @Override
@@ -199,10 +310,12 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     }
 
     PersistentWorkerMetrics.workerBorrowed(worker);
+    PersistentWorkerLifecycle.Lease lease = lifecycle.lease(worker, requestId(request));
+    idleMonitor.onUnavailable(worker);
     boolean postWorkCleanupCalled = false;
     try {
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_INPUT_SETUP_FAILURE);
-      WorkRequest workRequest = preWorkInit(workerKey, request, worker);
+      WorkRequest workRequest = preWorkInit(workerKey, request, worker, lease);
 
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
       WorkResponse workResponse;
@@ -224,7 +337,10 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
               : PersistentWorkerMetrics.OUTCOME_ACTION_FAILURE);
       String completedOutcome = request.outcome();
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
+      checkState(
+          lifecycle.release(lease), "persistent worker lease changed before a successful return");
       workerPool.release(workerKey, worker);
+      idleMonitor.onIdle(worker);
       PersistentWorkerMetrics.workerReturned(worker);
       request.setOutcome(completedOutcome);
       return responseAfterCleanup;
@@ -246,6 +362,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
           request.timedOut()
               ? PersistentWorkerMetrics.DESTROY_TIMEOUT
               : PersistentWorkerMetrics.DESTROY_REQUEST_FAILURE);
+      lifecycle.beginRetiring(lease);
+      idleMonitor.onUnavailable(worker);
       try {
         workerPool.invalidate(workerKey, worker);
       } catch (Exception invalidateEx) {
@@ -256,6 +374,12 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       }
       throw e;
     }
+  }
+
+  private static String requestId(RequestCtx request) {
+    String operationName =
+        request.filesContext == null ? "" : request.filesContext.opRoot.toString();
+    return operationName + "#" + Integer.toUnsignedString(System.identityHashCode(request));
   }
 
   private static boolean hasCause(Throwable error, Class<? extends Throwable> causeClass) {
@@ -323,13 +447,23 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   @Override
   public WorkRequest preWorkInit(WorkerKey key, RequestCtx request, PersistentWorker worker)
       throws IOException {
+    throw new IllegalStateException("preWorkInit requires a persistent-worker lease");
+  }
+
+  @VisibleForTesting
+  WorkRequest preWorkInit(
+      WorkerKey key,
+      RequestCtx request,
+      PersistentWorker worker,
+      PersistentWorkerLifecycle.Lease lease)
+      throws IOException {
     checkNotNull(request.timeout);
     RequestTimeoutHandler task = new RequestTimeoutHandler(request);
-    PendingRequest pendingRequest = new PendingRequest(worker, task);
+    PendingRequest pendingRequest = new PendingRequest(lease, task);
     PendingRequest alreadyPendingRequest = pendingReqs.putIfAbsent(request, pendingRequest);
     // null means that this request was not in pendingReqs (the expected case)
     if (alreadyPendingRequest != null) {
-      if (alreadyPendingRequest.worker != worker) {
+      if (alreadyPendingRequest.lease.worker() != worker) {
         throw new IllegalArgumentException(
             "Already have a persistent worker on the job: " + request.request);
       } else {
@@ -501,7 +635,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       try {
         PendingRequest pendingRequest = pendingReqs.remove(this.request);
         if (pendingRequest != null) {
-          onTimeout(this.request, pendingRequest.worker);
+          onTimeout(this.request, pendingRequest.lease);
         }
       } catch (Throwable t) {
         log.log(
@@ -512,23 +646,26 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     }
   }
 
-  private void onTimeout(RequestCtx request, PersistentWorker worker) {
+  @VisibleForTesting
+  void onTimeout(RequestCtx request, PersistentWorkerLifecycle.Lease lease) {
+    if (!lifecycle.beginRetiring(lease)) {
+      PersistentWorkerMetrics.staleLifecycleCallback("action_timeout");
+      return;
+    }
     request.markTimedOut();
-    if (worker != null) {
-      log.severe("Persistent Worker timed out on request: " + request.request);
-      try {
-        PersistentWorkerMetrics.markDestroyReason(
-            worker, PersistentWorkerMetrics.DESTROY_TIMEOUT);
-        this.workerPool.invalidateObject(worker.getKey(), worker);
-      } catch (Exception e) {
-        log.severe(
-            "Tried to invalidate worker for request:\n"
-                + request
-                + "\n\tbut got: "
-                + e
-                + "\n\nCalling worker.destroy() and moving on.");
-        worker.destroy();
-      }
+    PersistentWorker worker = lease.worker();
+    log.severe("Persistent Worker timed out on request: " + request.request);
+    try {
+      PersistentWorkerMetrics.markDestroyReason(worker, PersistentWorkerMetrics.DESTROY_TIMEOUT);
+      this.workerPool.invalidateObject(worker.getKey(), worker);
+    } catch (Exception e) {
+      log.severe(
+          "Tried to invalidate worker for request:\n"
+              + request
+              + "\n\tbut got: "
+              + e
+              + "\n\nCalling worker.destroy() and moving on.");
+      worker.destroy();
     }
   }
 }

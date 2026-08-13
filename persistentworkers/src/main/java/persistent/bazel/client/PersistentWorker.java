@@ -21,6 +21,7 @@ import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.Set;
 import java.util.logging.Level;
@@ -145,5 +146,9 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
   @Override
   public void destroy() {
     this.workerRW.getProcessWrapper().destroy();
+  }
+
+  public boolean terminate(Duration gracefulTermination) throws InterruptedException {
+    return this.workerRW.getProcessWrapper().terminate(gracefulTermination);
   }
 }

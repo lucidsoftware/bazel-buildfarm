@@ -171,6 +171,15 @@ worker:
     amount: 4 # for an A30 MiG in full splay
   persistentWorkerActionMnemonicAllowlist:
   - '*'
+  persistentWorkers:
+    maxWorkersPerKey: 6
+    maxWorkersTotal: 100
+    warmIdleWorkersPerKey: 0
+    # SHADOW only reports candidates. ENABLED retires pool-confirmed idle workers.
+    idleRetirementMode: DISABLED
+    idleTimeoutSeconds: 900
+    idleCheckIntervalSeconds: 30
+    gracefulTerminationSeconds: 5
 executionWrappers:
   cgroups2: /app/build_buildfarm/cgexec-wrapper
   unshare: /usr/bin/unshare

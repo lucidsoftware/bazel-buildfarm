@@ -48,6 +48,7 @@ final class PersistentWorkerMetrics {
   static final String DESTROY_POOL = "pool";
   static final String DESTROY_REQUEST_FAILURE = "request_failure";
   static final String DESTROY_TIMEOUT = "timeout";
+  static final String DESTROY_IDLE_TIMEOUT = "idle_timeout";
   static final String DESTROY_UNEXPECTED_EXIT = "unexpected_exit";
 
   private static final double[] TIME_BUCKETS = {
@@ -136,6 +137,29 @@ final class PersistentWorkerMetrics {
           .buckets(1, 5, 10, 30, 60, 300, 900, 3600, 10800, 21600, 43200, 86400)
           .help("Lifetime of a persistent-worker process when it is destroyed.")
           .register();
+  private static final Counter lifecycleTransitions =
+      Counter.build()
+          .name("persistent_worker_lifecycle_transitions_total")
+          .labelNames("from", "to")
+          .help("Persistent-worker lifecycle transitions by bounded state pair.")
+          .register();
+  private static final Counter staleLifecycleCallbacks =
+      Counter.build()
+          .name("persistent_worker_stale_lifecycle_callbacks_total")
+          .labelNames("kind")
+          .help("Lifecycle callbacks ignored because their worker lease was no longer current.")
+          .register();
+  private static final Counter idleCandidates =
+      Counter.build()
+          .name("persistent_worker_idle_candidates_total")
+          .labelNames("mode")
+          .help("Generation-validated persistent workers reaching the configured idle timeout.")
+          .register();
+  private static final Counter terminationFailures =
+      Counter.build()
+          .name("persistent_worker_termination_failures_total")
+          .help("Persistent-worker process trees not confirmed terminated within the bound.")
+          .register();
 
   private enum State {
     NEW,
@@ -204,6 +228,22 @@ final class PersistentWorkerMetrics {
 
   static void poolWaitFinished() {
     poolWaiters.dec();
+  }
+
+  static void lifecycleTransition(String from, String to) {
+    lifecycleTransitions.labels(from, to).inc();
+  }
+
+  static void staleLifecycleCallback(String kind) {
+    staleLifecycleCallbacks.labels(kind).inc();
+  }
+
+  static void idleCandidate(String mode) {
+    idleCandidates.labels(mode).inc();
+  }
+
+  static void terminationFailure() {
+    terminationFailures.inc();
   }
 
   static void workerStarted(PersistentWorker worker) {

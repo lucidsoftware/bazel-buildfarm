@@ -78,6 +78,7 @@ import build.buildfarm.worker.PutOperationStage;
 import build.buildfarm.worker.ReportResultStage;
 import build.buildfarm.worker.SuperscalarPipelineStage;
 import build.buildfarm.worker.cgroup.Group;
+import build.buildfarm.worker.persistent.PersistentExecutor;
 import build.buildfarm.worker.resources.LocalResourceSet;
 import build.buildfarm.worker.resources.LocalResourceSet.PoolResource;
 import build.buildfarm.worker.resources.LocalResourceSetUtils;
@@ -120,8 +121,10 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -156,6 +159,22 @@ public final class Worker extends LoggingMain {
           .name("report_result_slots_total")
           .help("Total report result slots configured on worker.")
           .register();
+  private static final Gauge workerRegistrationHealthy =
+      Gauge.build()
+          .name("worker_registration_healthy")
+          .help("Whether the worker most recently registered successfully with the backplane.")
+          .register();
+  private static final Gauge workerRegistrationBackoffSeconds =
+      Gauge.build()
+          .name("worker_registration_backoff_seconds")
+          .help("Current registration retry backoff in seconds.")
+          .register();
+  private static final Counter workerRegistrationFailures =
+      Counter.build()
+          .name("worker_registration_failures")
+          .labelNames("code")
+          .help("Worker registration failures by gRPC status code.")
+          .register();
 
   private static final int shutdownWaitTimeInSeconds = 10;
 
@@ -177,6 +196,9 @@ public final class Worker extends LoggingMain {
   private LoadingCache<String, StubInstance> workerStubs;
   private AtomicBoolean released = new AtomicBoolean(true);
   private AtomicBoolean shutdownInitiated = new AtomicBoolean(false);
+  private final AtomicBoolean storageReady = new AtomicBoolean(false);
+  private final AtomicBoolean registrationHealthy = new AtomicBoolean(false);
+  private final AtomicReference<RuntimeException> registrationFailure = new AtomicReference<>();
   private boolean startWritable = true;
 
   /**
@@ -627,11 +649,7 @@ public final class Worker extends LoggingMain {
     try {
       backplane.removeWorker(name, "removing self prior to initialization");
     } catch (IOException e) {
-      Status status = Status.fromThrowable(e);
-      if (status.getCode() != Code.UNAVAILABLE && status.getCode() != Code.DEADLINE_EXCEEDED) {
-        throw status.asRuntimeException();
-      }
-      log.log(INFO, "backplane was unavailable or overloaded, deferring removeWorker");
+      throw Status.fromThrowable(e).asRuntimeException();
     }
   }
 
@@ -653,18 +671,38 @@ public final class Worker extends LoggingMain {
   }
 
   private void addWorker(ShardWorker worker) {
-    while (!backplane.isStopped()) {
-      try {
-        backplane.addWorker(worker);
-        return;
-      } catch (IOException e) {
-        Status status = Status.fromThrowable(e);
-        if (status.getCode() != Code.UNAVAILABLE && status.getCode() != Code.DEADLINE_EXCEEDED) {
-          throw status.asRuntimeException();
-        }
-      }
+    try {
+      backplane.addWorker(worker);
+    } catch (IOException e) {
+      throw Status.fromThrowable(e).asRuntimeException();
     }
-    throw Status.UNAVAILABLE.withDescription("backplane was stopped").asRuntimeException();
+  }
+
+  private void updateRegistrationAwareHealth() {
+    healthStatusManager.setStatus(
+        HealthStatusManager.SERVICE_NAME_ALL_SERVICES,
+        registrationAwareHealth(storageReady.get(), registrationHealthy.get()));
+  }
+
+  static ServingStatus registrationAwareHealth(boolean storageReady, boolean registered) {
+    return storageReady && registered ? ServingStatus.SERVING : ServingStatus.NOT_SERVING;
+  }
+
+  static boolean isRetryableRegistrationFailure(Throwable failure) {
+    Status status = Status.fromThrowable(failure);
+    return status.getCode() == Code.UNAVAILABLE || status.getCode() == Code.DEADLINE_EXCEEDED;
+  }
+
+  static long registrationBackoffUpperBoundSeconds(int consecutiveFailures) {
+    return Math.min(30, 1L << Math.min(consecutiveFailures, 5));
+  }
+
+  static boolean removeStaleWorkerBeforeFirstRegistration(
+      boolean removalPending, Runnable removeWorker) {
+    if (removalPending) {
+      removeWorker.run();
+    }
+    return false;
   }
 
   private void startFailsafeRegistration(Supplier<Boolean> isReadOnly) {
@@ -677,6 +715,8 @@ public final class Worker extends LoggingMain {
     new Thread(
             new Runnable() {
               long workerRegistrationExpiresAt = 0;
+              int consecutiveFailures = 0;
+              boolean removeBeforeFirstRegistration = true;
 
               ShardWorker nextRegistration(long now) {
                 return worker
@@ -709,8 +749,17 @@ public final class Worker extends LoggingMain {
                 if (now >= workerRegistrationExpiresAt
                     && !context.inGracefulShutdown()
                     && !isWorkerPausedFromNewWork()) {
+                  removeBeforeFirstRegistration =
+                      removeStaleWorkerBeforeFirstRegistration(
+                          removeBeforeFirstRegistration,
+                          () -> removeWorker(configs.getWorker().getPublicName()));
                   // worker must be registered to match
                   addWorker(nextRegistration(now));
+                  consecutiveFailures = 0;
+                  registrationHealthy.set(true);
+                  workerRegistrationHealthy.set(1);
+                  workerRegistrationBackoffSeconds.set(0);
+                  updateRegistrationAwareHealth();
                   // update every 10 seconds
                   workerRegistrationExpiresAt = nextInterval(now);
                 }
@@ -720,11 +769,42 @@ public final class Worker extends LoggingMain {
               public void run() {
                 try {
                   while (server != null && !server.isShutdown()) {
-                    registerIfExpired();
+                    try {
+                      registerIfExpired();
+                    } catch (RuntimeException e) {
+                      registrationHealthy.set(false);
+                      workerRegistrationHealthy.set(0);
+                      updateRegistrationAwareHealth();
+
+                      Status status = Status.fromThrowable(e);
+                      workerRegistrationFailures.labels(status.getCode().name()).inc();
+                      if (!isRetryableRegistrationFailure(e) || backplane.isStopped()) {
+                        registrationFailure.compareAndSet(null, e);
+                        log.log(
+                            SEVERE,
+                            "worker registration cannot recover; shutting down for restart",
+                            e);
+                        initiateShutdown();
+                        server.shutdownNow();
+                        return;
+                      }
+
+                      consecutiveFailures++;
+                      long maxBackoffSeconds =
+                          registrationBackoffUpperBoundSeconds(consecutiveFailures);
+                      long backoffSeconds =
+                          ThreadLocalRandom.current().nextLong(1, maxBackoffSeconds + 1);
+                      workerRegistrationBackoffSeconds.set(backoffSeconds);
+                      log.log(
+                          Level.WARNING,
+                          "worker registration failed; retrying in {0} seconds",
+                          backoffSeconds);
+                      SECONDS.sleep(backoffSeconds);
+                    }
                     SECONDS.sleep(1);
                   }
                 } catch (InterruptedException e) {
-                  // ignore
+                  Thread.currentThread().interrupt();
                 }
               }
             },
@@ -903,8 +983,7 @@ public final class Worker extends LoggingMain {
             reportResultStage,
             completeStage);
     server = createServer(serverBuilder, instance, workerProfileService);
-
-    removeWorker(configs.getWorker().getPublicName());
+    updateRegistrationAwareHealth();
 
     boolean skipLoad = configs.getWorker().getStorages().getFirst().isSkipLoad();
     ListenableFuture<Void> fileSystemStarted =
@@ -914,15 +993,15 @@ public final class Worker extends LoggingMain {
             startWritable);
 
     server.start();
+    PrometheusPublisher.startHttpServer(configs.getPrometheusPort());
     Futures.addCallback(
         fileSystemStarted,
         new FutureCallback<>() {
           @Override
           public void onSuccess(Void result) {
             log.log(INFO, String.format("%s initialized", identifier));
-            healthStatusManager.setStatus(
-                HealthStatusManager.SERVICE_NAME_ALL_SERVICES, ServingStatus.SERVING);
-            PrometheusPublisher.startHttpServer(configs.getPrometheusPort());
+            storageReady.set(true);
+            updateRegistrationAwareHealth();
           }
 
           @Override
@@ -968,6 +1047,10 @@ public final class Worker extends LoggingMain {
         server.shutdownNow();
         server.awaitTermination();
       }
+    }
+    RuntimeException failure = registrationFailure.get();
+    if (failure != null) {
+      throw failure;
     }
   }
 
@@ -1037,8 +1120,13 @@ public final class Worker extends LoggingMain {
         interrupted = true;
       }
     }
+    PersistentExecutor.shutdown();
     healthStatusManager.setStatus(
         HealthStatusManager.SERVICE_NAME_ALL_SERVICES, ServingStatus.NOT_SERVING);
+    storageReady.set(false);
+    registrationHealthy.set(false);
+    workerRegistrationHealthy.set(0);
+    workerRegistrationBackoffSeconds.set(0);
     healthCheckMetric.labels("stop").inc();
     executionSlotsTotal.set(0);
     inputFetchSlotsTotal.set(0);
@@ -1099,10 +1187,13 @@ public final class Worker extends LoggingMain {
       worker.awaitTermination();
     } catch (IOException e) {
       log.severe(formatIOError(e));
+      throw e;
     } catch (InterruptedException e) {
       log.log(Level.WARNING, "interrupted", e);
+      Thread.currentThread().interrupt();
     } catch (Exception e) {
       log.log(Level.SEVERE, "Error running application", e);
+      throw e;
     } finally {
       worker.stop();
     }

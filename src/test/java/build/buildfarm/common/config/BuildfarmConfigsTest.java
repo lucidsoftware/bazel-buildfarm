@@ -447,4 +447,41 @@ public class BuildfarmConfigsTest {
     assertEquals(25L, storage.getEvictorWakeBudgetMillis());
     assertEquals(3000L, storage.getEvictorIdleHeartbeatMillis());
   }
+
+  @Test
+  public void loadConfigs_withPersistentWorkerLifecycleSettings_parsesCorrectly()
+      throws IOException {
+    Path configFile = tempDir.resolve("persistent-workers.yaml");
+    String yamlContent =
+        "worker:\n"
+            + "  persistentWorkers:\n"
+            + "    maxWorkersPerKey: 4\n"
+            + "    maxWorkersTotal: 40\n"
+            + "    warmIdleWorkersPerKey: 1\n"
+            + "    idleRetirementMode: ENABLED\n"
+            + "    idleTimeoutSeconds: 120\n"
+            + "    idleCheckIntervalSeconds: 15\n"
+            + "    gracefulTerminationSeconds: 3\n";
+    Files.write(configFile, yamlContent.getBytes());
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+    PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
+    assertEquals(4, settings.getMaxWorkersPerKey());
+    assertEquals(40, settings.getMaxWorkersTotal());
+    assertEquals(1, settings.getWarmIdleWorkersPerKey());
+    assertEquals(PersistentWorkers.IdleRetirementMode.ENABLED, settings.getIdleRetirementMode());
+    assertEquals(120L, settings.getIdleTimeoutSeconds());
+    assertEquals(15L, settings.getIdleCheckIntervalSeconds());
+    assertEquals(3L, settings.getGracefulTerminationSeconds());
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsWarmCountAbovePerKeyMaximum() {
+    PersistentWorkers settings = new PersistentWorkers();
+    settings.setMaxWorkersPerKey(2);
+    settings.setWarmIdleWorkersPerKey(3);
+
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
 }
