@@ -136,6 +136,12 @@ final class PersistentWorkerMetrics {
           .buckets(1, 5, 10, 30, 60, 300, 900, 3600, 10800, 21600, 43200, 86400)
           .help("Lifetime of a persistent-worker process when it is destroyed.")
           .register();
+  private static final Counter lifecycleTransitions =
+      Counter.build()
+          .name("persistent_worker_lifecycle_transitions_total")
+          .labelNames("from", "to")
+          .help("Persistent-worker lifecycle transitions by bounded state pair.")
+          .register();
 
   private enum State {
     NEW,
@@ -204,6 +210,10 @@ final class PersistentWorkerMetrics {
 
   static void poolWaitFinished() {
     poolWaiters.dec();
+  }
+
+  static void lifecycleTransition(String from, String to) {
+    lifecycleTransitions.labels(from, to).inc();
   }
 
   static void workerStarted(PersistentWorker worker) {

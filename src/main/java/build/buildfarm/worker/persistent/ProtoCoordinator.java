@@ -15,6 +15,7 @@
 package build.buildfarm.worker.persistent;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
@@ -52,6 +53,8 @@ import persistent.bazel.client.WorkerSupervisor;
 @Log
 public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool> {
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
+
+  private final PersistentWorkerLifecycle lifecycle;
 
   private record PendingRequest(PersistentWorker worker, RequestTimeoutHandler task) {
     private PendingRequest {
@@ -95,10 +98,13 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
   public ProtoCoordinator(CommonsWorkerPool workerPool) {
     super(workerPool);
+    lifecycle = new PersistentWorkerLifecycle();
   }
 
-  private ProtoCoordinator(WorkerSupervisor supervisor, int maxWorkersPerKey) {
+  private ProtoCoordinator(
+      WorkerSupervisor supervisor, int maxWorkersPerKey, PersistentWorkerLifecycle lifecycle) {
     super(new CommonsWorkerPool(supervisor, maxWorkersPerKey));
+    this.lifecycle = lifecycle;
   }
 
   // We copy tool inputs from the shared WorkerKey tools directory into our worker exec root,
@@ -106,6 +112,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   //    and presumably there might be writes to tool inputs?
   // Tool inputs which are absolute-paths (e.g. /usr/bin/...) are not affected
   public static ProtoCoordinator ofCommonsPool(int maxWorkersPerKey) {
+    PersistentWorkerLifecycle lifecycle = new PersistentWorkerLifecycle();
     WorkerSupervisor loadToolsOnCreate =
         new WorkerSupervisor() {
           @Override
@@ -136,6 +143,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             long workerStartStarted = PersistentWorkerMetrics.startTimer();
             try {
               PersistentWorker worker = new PersistentWorker(workerKey, workerExecDir);
+              lifecycle.register(worker);
               PersistentWorkerMetrics.workerStarted(worker);
               return worker;
             } finally {
@@ -156,14 +164,16 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
           @Override
           public void destroyObject(WorkerKey key, PooledObject<PersistentWorker> pooled) {
+            lifecycle.beginRetiring(pooled.getObject());
             try {
               super.destroyObject(key, pooled);
             } finally {
+              lifecycle.terminated(pooled.getObject());
               PersistentWorkerMetrics.workerDestroyed(pooled.getObject());
             }
           }
         };
-    return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey);
+    return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey, lifecycle);
   }
 
   @Override
@@ -199,6 +209,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     }
 
     PersistentWorkerMetrics.workerBorrowed(worker);
+    PersistentWorkerLifecycle.Lease lease = lifecycle.lease(worker, requestId(request));
     boolean postWorkCleanupCalled = false;
     try {
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_INPUT_SETUP_FAILURE);
@@ -224,6 +235,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
               : PersistentWorkerMetrics.OUTCOME_ACTION_FAILURE);
       String completedOutcome = request.outcome();
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
+      checkState(
+          lifecycle.release(lease), "persistent worker lease changed before a successful return");
       workerPool.release(workerKey, worker);
       PersistentWorkerMetrics.workerReturned(worker);
       request.setOutcome(completedOutcome);
@@ -246,6 +259,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
           request.timedOut()
               ? PersistentWorkerMetrics.DESTROY_TIMEOUT
               : PersistentWorkerMetrics.DESTROY_REQUEST_FAILURE);
+      lifecycle.beginRetiring(lease);
       try {
         workerPool.invalidate(workerKey, worker);
       } catch (Exception invalidateEx) {
@@ -256,6 +270,12 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       }
       throw e;
     }
+  }
+
+  private static String requestId(RequestCtx request) {
+    String operationName =
+        request.filesContext == null ? "" : request.filesContext.opRoot.toString();
+    return operationName + "#" + Integer.toUnsignedString(System.identityHashCode(request));
   }
 
   private static boolean hasCause(Throwable error, Class<? extends Throwable> causeClass) {
@@ -517,8 +537,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     if (worker != null) {
       log.severe("Persistent Worker timed out on request: " + request.request);
       try {
-        PersistentWorkerMetrics.markDestroyReason(
-            worker, PersistentWorkerMetrics.DESTROY_TIMEOUT);
+        PersistentWorkerMetrics.markDestroyReason(worker, PersistentWorkerMetrics.DESTROY_TIMEOUT);
         this.workerPool.invalidateObject(worker.getKey(), worker);
       } catch (Exception e) {
         log.severe(
