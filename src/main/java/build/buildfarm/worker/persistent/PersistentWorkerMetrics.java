@@ -142,6 +142,12 @@ final class PersistentWorkerMetrics {
           .labelNames("from", "to")
           .help("Persistent-worker lifecycle transitions by bounded state pair.")
           .register();
+  private static final Counter staleLifecycleCallbacks =
+      Counter.build()
+          .name("persistent_worker_stale_lifecycle_callbacks_total")
+          .labelNames("kind")
+          .help("Lifecycle callbacks ignored because their worker lease was no longer current.")
+          .register();
 
   private enum State {
     NEW,
@@ -214,6 +220,10 @@ final class PersistentWorkerMetrics {
 
   static void lifecycleTransition(String from, String to) {
     lifecycleTransitions.labels(from, to).inc();
+  }
+
+  static void staleLifecycleCallback(String kind) {
+    staleLifecycleCallbacks.labels(kind).inc();
   }
 
   static void workerStarted(PersistentWorker worker) {
