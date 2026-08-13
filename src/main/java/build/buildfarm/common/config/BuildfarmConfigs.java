@@ -261,6 +261,10 @@ public final class BuildfarmConfigs {
           "persistentWorkers.idleCheckIntervalSeconds must be positive when idle retirement is"
               + " enabled");
     }
+    if (settings.getGracefulTerminationSeconds() < 0) {
+      throw new ConfigurationException(
+          "persistentWorkers.gracefulTerminationSeconds must not be negative");
+    }
   }
 
   private static void adjustExecuteStageWidth(BuildfarmConfigs configs) {

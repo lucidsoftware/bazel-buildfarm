@@ -27,9 +27,14 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import lombok.Getter;
 import lombok.extern.java.Log;
@@ -135,6 +140,60 @@ public class ProcessWrapper implements Closeable {
 
   public void destroy() {
     this.process.destroyForcibly();
+  }
+
+  /**
+   * Requests graceful process-tree termination, then escalates to a forced kill after the grace.
+   */
+  public boolean terminate(Duration gracefulTermination) throws InterruptedException {
+    Preconditions.checkArgument(!gracefulTermination.isNegative());
+    if (!process.isAlive()) {
+      return true;
+    }
+
+    List<ProcessHandle> processTree = new ArrayList<>(process.descendants().toList());
+    processTree.add(process.toHandle());
+    try {
+      process.getOutputStream().close();
+    } catch (IOException e) {
+      log.log(Level.FINE, "Could not close process stdin during graceful termination", e);
+    }
+    terminateTree(processTree, false);
+    if (waitForTree(processTree, gracefulTermination)) {
+      return true;
+    }
+
+    terminateTree(processTree, true);
+    Duration forcedTerminationWait =
+        gracefulTermination.isZero() ? Duration.ofSeconds(1) : gracefulTermination;
+    return waitForTree(processTree, forcedTerminationWait);
+  }
+
+  private static void terminateTree(List<ProcessHandle> processTree, boolean forcibly) {
+    List<ProcessHandle> childrenFirst = new ArrayList<>(processTree);
+    Collections.reverse(childrenFirst);
+    for (ProcessHandle handle : childrenFirst) {
+      if (handle.isAlive()) {
+        if (forcibly) {
+          handle.destroyForcibly();
+        } else {
+          handle.destroy();
+        }
+      }
+    }
+  }
+
+  private static boolean waitForTree(List<ProcessHandle> processTree, Duration timeout)
+      throws InterruptedException {
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (processTree.stream().anyMatch(ProcessHandle::isAlive)) {
+      long remainingNanos = deadline - System.nanoTime();
+      if (remainingNanos <= 0) {
+        return false;
+      }
+      TimeUnit.NANOSECONDS.sleep(Math.min(remainingNanos, TimeUnit.MILLISECONDS.toNanos(10)));
+    }
+    return true;
   }
 
   @Override

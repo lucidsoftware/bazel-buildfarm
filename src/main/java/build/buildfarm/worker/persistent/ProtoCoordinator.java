@@ -19,6 +19,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 
 import build.buildfarm.common.config.PersistentWorkers;
+import build.buildfarm.common.io.Directories;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
@@ -197,7 +198,21 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             idleMonitor.onUnavailable(worker);
             lifecycle.beginRetiring(worker);
             try {
-              super.destroyObject(key, pooled);
+              boolean terminated =
+                  worker.terminate(Duration.ofSeconds(settings.getGracefulTerminationSeconds()));
+              if (terminated) {
+                removeWorkerExecRoot(key, worker);
+              } else {
+                PersistentWorkerMetrics.terminationFailure();
+                log.severe(
+                    "Persistent worker process tree did not terminate; preserving exec root: "
+                        + worker.getExecRoot());
+              }
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              worker.destroy();
+              PersistentWorkerMetrics.terminationFailure();
+              log.log(Level.WARNING, "Interrupted while terminating persistent worker", e);
             } finally {
               lifecycle.terminated(worker);
               PersistentWorkerMetrics.workerDestroyed(worker);
@@ -224,6 +239,27 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       checkArgument(
           settings.getIdleCheckIntervalSeconds() > 0,
           "idleCheckIntervalSeconds must be positive when idle retirement is enabled");
+    }
+    checkArgument(
+        settings.getGracefulTerminationSeconds() >= 0,
+        "gracefulTerminationSeconds must not be negative");
+  }
+
+  private static void removeWorkerExecRoot(WorkerKey key, PersistentWorker worker) {
+    Path workerExecRoot = worker.getExecRoot().toAbsolutePath().normalize();
+    Path keyExecRoot = key.getExecRoot().toAbsolutePath().normalize();
+    if (!keyExecRoot.equals(workerExecRoot.getParent())) {
+      log.severe(
+          "Refusing to remove persistent worker exec root outside its key root: " + workerExecRoot);
+      return;
+    }
+    if (!Files.exists(workerExecRoot)) {
+      return;
+    }
+    try {
+      Directories.remove(workerExecRoot, Files.getFileStore(workerExecRoot));
+    } catch (IOException e) {
+      log.log(Level.WARNING, "Could not remove persistent worker exec root " + workerExecRoot, e);
     }
   }
 

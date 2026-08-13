@@ -460,7 +460,8 @@ public class BuildfarmConfigsTest {
             + "    warmIdleWorkersPerKey: 1\n"
             + "    idleRetirementMode: ENABLED\n"
             + "    idleTimeoutSeconds: 120\n"
-            + "    idleCheckIntervalSeconds: 15\n";
+            + "    idleCheckIntervalSeconds: 15\n"
+            + "    gracefulTerminationSeconds: 3\n";
     Files.write(configFile, yamlContent.getBytes());
 
     BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
@@ -471,6 +472,7 @@ public class BuildfarmConfigsTest {
     assertEquals(PersistentWorkers.IdleRetirementMode.ENABLED, settings.getIdleRetirementMode());
     assertEquals(120L, settings.getIdleTimeoutSeconds());
     assertEquals(15L, settings.getIdleCheckIntervalSeconds());
+    assertEquals(3L, settings.getGracefulTerminationSeconds());
   }
 
   @Test
