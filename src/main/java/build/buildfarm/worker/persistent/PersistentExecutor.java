@@ -17,6 +17,8 @@ package build.buildfarm.worker.persistent;
 import static java.lang.String.join;
 
 import build.bazel.remote.execution.v2.ActionResult;
+import build.buildfarm.common.config.BuildfarmConfigs;
+import build.buildfarm.common.config.PersistentWorkers;
 import build.buildfarm.worker.resources.ResourceLimits;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
@@ -46,8 +48,7 @@ import persistent.bazel.client.WorkerKey;
  */
 @Log
 public class PersistentExecutor {
-  private static final ProtoCoordinator coordinator =
-      ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey());
+  private static final ProtoCoordinator coordinator = createCoordinator();
 
   // TODO load from config (i.e. {worker_root}/persistent)
   public static final Path defaultWorkRootsDir = Path.of("/tmp/worker/persistent/");
@@ -65,6 +66,11 @@ public class PersistentExecutor {
   // There may be multiple WorkerKeys per mnemonic,
   //  e.g. if builds are run with different tool fingerprints
   private static final int defaultMaxWorkersPerKey = 6;
+
+  private static ProtoCoordinator createCoordinator() {
+    PersistentWorkers settings = BuildfarmConfigs.getInstance().getWorker().getPersistentWorkers();
+    return ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey(), settings);
+  }
 
   private static int getMaxWorkersPerKey() {
     try {
@@ -194,8 +200,7 @@ public class PersistentExecutor {
             .build();
 
     RequestCtx requestCtx =
-        new RequestCtx(
-            request, context, workerFiles, timeout, persistentWorkerRequestStarted);
+        new RequestCtx(request, context, workerFiles, timeout, persistentWorkerRequestStarted);
 
     // Run request
     // Required file operations (in/out) are the responsibility of the coordinator

@@ -447,4 +447,20 @@ public class BuildfarmConfigsTest {
     assertEquals(25L, storage.getEvictorWakeBudgetMillis());
     assertEquals(3000L, storage.getEvictorIdleHeartbeatMillis());
   }
+
+  @Test
+  public void loadConfigs_withPersistentWorkerIdleShadowMode_parsesCorrectly() throws IOException {
+    Path configFile = tempDir.resolve("persistent-workers.yaml");
+    String yamlContent =
+        "worker:\n"
+            + "  persistentWorkers:\n"
+            + "    idleRetirementMode: SHADOW\n"
+            + "    idleTimeoutSeconds: 120\n";
+    Files.write(configFile, yamlContent.getBytes());
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+    PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
+    assertEquals(PersistentWorkers.IdleRetirementMode.SHADOW, settings.getIdleRetirementMode());
+    assertEquals(120L, settings.getIdleTimeoutSeconds());
+  }
 }
