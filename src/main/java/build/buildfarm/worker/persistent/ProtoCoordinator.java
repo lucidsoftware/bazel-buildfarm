@@ -54,11 +54,11 @@ import persistent.bazel.client.WorkerSupervisor;
 public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool> {
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
 
-  private final PersistentWorkerLifecycle lifecycle;
+  @VisibleForTesting final PersistentWorkerLifecycle lifecycle;
 
-  private record PendingRequest(PersistentWorker worker, RequestTimeoutHandler task) {
+  private record PendingRequest(PersistentWorkerLifecycle.Lease lease, RequestTimeoutHandler task) {
     private PendingRequest {
-      Objects.requireNonNull(worker);
+      Objects.requireNonNull(lease);
       Objects.requireNonNull(task);
     }
   }
@@ -213,7 +213,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     boolean postWorkCleanupCalled = false;
     try {
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_INPUT_SETUP_FAILURE);
-      WorkRequest workRequest = preWorkInit(workerKey, request, worker);
+      WorkRequest workRequest = preWorkInit(workerKey, request, worker, lease);
 
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
       WorkResponse workResponse;
@@ -343,13 +343,23 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   @Override
   public WorkRequest preWorkInit(WorkerKey key, RequestCtx request, PersistentWorker worker)
       throws IOException {
+    throw new IllegalStateException("preWorkInit requires a persistent-worker lease");
+  }
+
+  @VisibleForTesting
+  WorkRequest preWorkInit(
+      WorkerKey key,
+      RequestCtx request,
+      PersistentWorker worker,
+      PersistentWorkerLifecycle.Lease lease)
+      throws IOException {
     checkNotNull(request.timeout);
     RequestTimeoutHandler task = new RequestTimeoutHandler(request);
-    PendingRequest pendingRequest = new PendingRequest(worker, task);
+    PendingRequest pendingRequest = new PendingRequest(lease, task);
     PendingRequest alreadyPendingRequest = pendingReqs.putIfAbsent(request, pendingRequest);
     // null means that this request was not in pendingReqs (the expected case)
     if (alreadyPendingRequest != null) {
-      if (alreadyPendingRequest.worker != worker) {
+      if (alreadyPendingRequest.lease.worker() != worker) {
         throw new IllegalArgumentException(
             "Already have a persistent worker on the job: " + request.request);
       } else {
@@ -521,7 +531,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       try {
         PendingRequest pendingRequest = pendingReqs.remove(this.request);
         if (pendingRequest != null) {
-          onTimeout(this.request, pendingRequest.worker);
+          onTimeout(this.request, pendingRequest.lease);
         }
       } catch (Throwable t) {
         log.log(
@@ -532,22 +542,26 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     }
   }
 
-  private void onTimeout(RequestCtx request, PersistentWorker worker) {
+  @VisibleForTesting
+  void onTimeout(RequestCtx request, PersistentWorkerLifecycle.Lease lease) {
+    if (!lifecycle.beginRetiring(lease)) {
+      PersistentWorkerMetrics.staleLifecycleCallback("action_timeout");
+      return;
+    }
     request.markTimedOut();
-    if (worker != null) {
-      log.severe("Persistent Worker timed out on request: " + request.request);
-      try {
-        PersistentWorkerMetrics.markDestroyReason(worker, PersistentWorkerMetrics.DESTROY_TIMEOUT);
-        this.workerPool.invalidateObject(worker.getKey(), worker);
-      } catch (Exception e) {
-        log.severe(
-            "Tried to invalidate worker for request:\n"
-                + request
-                + "\n\tbut got: "
-                + e
-                + "\n\nCalling worker.destroy() and moving on.");
-        worker.destroy();
-      }
+    PersistentWorker worker = lease.worker();
+    log.severe("Persistent Worker timed out on request: " + request.request);
+    try {
+      PersistentWorkerMetrics.markDestroyReason(worker, PersistentWorkerMetrics.DESTROY_TIMEOUT);
+      this.workerPool.invalidateObject(worker.getKey(), worker);
+    } catch (Exception e) {
+      log.severe(
+          "Tried to invalidate worker for request:\n"
+              + request
+              + "\n\tbut got: "
+              + e
+              + "\n\nCalling worker.destroy() and moving on.");
+      worker.destroy();
     }
   }
 }
