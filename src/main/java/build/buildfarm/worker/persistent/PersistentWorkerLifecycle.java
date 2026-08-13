@@ -88,6 +88,16 @@ final class PersistentWorkerLifecycle {
     return true;
   }
 
+  synchronized boolean beginRetiringIdle(PersistentWorker worker, long generation) {
+    Entry entry = entries.get(worker);
+    if (entry == null || entry.state != State.IDLE || entry.generation != generation) {
+      return false;
+    }
+    entry.state = State.RETIRING;
+    PersistentWorkerMetrics.lifecycleTransition("idle", "retiring");
+    return true;
+  }
+
   synchronized void beginRetiring(PersistentWorker worker) {
     Entry entry = entries.get(worker);
     if (entry == null || entry.state == State.RETIRING || entry.state == State.TERMINATED) {

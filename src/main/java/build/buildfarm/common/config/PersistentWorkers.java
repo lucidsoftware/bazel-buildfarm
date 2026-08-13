@@ -21,9 +21,14 @@ import lombok.Data;
 public class PersistentWorkers {
   public enum IdleRetirementMode {
     DISABLED,
-    SHADOW
+    SHADOW,
+    ENABLED
   }
 
+  private int maxWorkersPerKey = 6;
+  private int maxWorkersTotal = 100;
+  private int warmIdleWorkersPerKey = 0;
   private IdleRetirementMode idleRetirementMode = IdleRetirementMode.DISABLED;
   private long idleTimeoutSeconds = 900;
+  private long idleCheckIntervalSeconds = 30;
 }

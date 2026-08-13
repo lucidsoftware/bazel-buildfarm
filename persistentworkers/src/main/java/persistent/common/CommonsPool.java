@@ -15,8 +15,10 @@
 package persistent.common;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.NoSuchElementException;
 import org.apache.commons.pool2.BaseKeyedPooledObjectFactory;
+import org.apache.commons.pool2.impl.EvictionPolicy;
 import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 
 /**
@@ -28,6 +30,17 @@ import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
   public CommonsPool(BaseKeyedPooledObjectFactory<K, V> factory, int maxPerKey) {
     super(factory, makeConfig(maxPerKey));
+  }
+
+  public CommonsPool(
+      BaseKeyedPooledObjectFactory<K, V> factory,
+      int maxPerKey,
+      int maxTotal,
+      int minIdlePerKey,
+      Duration evictionInterval,
+      EvictionPolicy<V> evictionPolicy) {
+    super(factory, makeConfig(maxPerKey, maxTotal, minIdlePerKey, evictionInterval));
+    setEvictionPolicy(evictionPolicy);
   }
 
   @Override
@@ -56,20 +69,24 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
   }
 
   static <V> GenericKeyedObjectPoolConfig<V> makeConfig(int max) {
+    return makeConfig(max, -1, max, Duration.ofMillis(-1));
+  }
+
+  static <V> GenericKeyedObjectPoolConfig<V> makeConfig(
+      int maxPerKey, int maxTotal, int minIdlePerKey, Duration evictionInterval) {
     GenericKeyedObjectPoolConfig<V> config = new GenericKeyedObjectPoolConfig<>();
 
     // It's better to re-use a worker as often as possible and keep it hot, in order to profit
     // from JIT optimizations as much as possible.
     config.setLifo(true);
 
-    // Keep a fixed number of workers running per key.
-    config.setMaxIdlePerKey(max);
-    config.setMaxTotalPerKey(max);
-    config.setMinIdlePerKey(max);
+    // Configure per-key and pool-wide process limits.
+    config.setMaxIdlePerKey(maxPerKey);
+    config.setMaxTotalPerKey(maxPerKey);
+    config.setMinIdlePerKey(minIdlePerKey);
 
-    // Don't limit the total number of worker processes, as otherwise the pool might be full of
-    // workers for one WorkerKey and can't accommodate a worker for another WorkerKey.
-    config.setMaxTotal(-1);
+    // A negative total preserves Commons Pool's unlimited behavior.
+    config.setMaxTotal(maxTotal);
 
     // Wait for a worker to become ready when a thread needs one.
     config.setBlockWhenExhausted(true);
@@ -79,8 +96,11 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
     config.setTestOnCreate(true);
     config.setTestOnReturn(true);
 
-    // No eviction of idle workers.
-    config.setTimeBetweenEvictionRunsMillis(-1);
+    // A negative interval disables eviction; otherwise inspect every idle object on each run.
+    config.setTimeBetweenEvictionRuns(evictionInterval);
+    if (!evictionInterval.isNegative()) {
+      config.setNumTestsPerEvictionRun(-1);
+    }
     return config;
   }
 }

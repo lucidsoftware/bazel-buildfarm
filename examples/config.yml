@@ -172,9 +172,13 @@ worker:
   persistentWorkerActionMnemonicAllowlist:
   - '*'
   persistentWorkers:
-    # SHADOW reports workers that have remained idle for the timeout, but never retires them.
+    maxWorkersPerKey: 6
+    maxWorkersTotal: 100
+    warmIdleWorkersPerKey: 0
+    # SHADOW only reports candidates. ENABLED retires pool-confirmed idle workers.
     idleRetirementMode: DISABLED
     idleTimeoutSeconds: 900
+    idleCheckIntervalSeconds: 30
 executionWrappers:
   cgroups2: /app/build_buildfarm/cgexec-wrapper
   unshare: /usr/bin/unshare

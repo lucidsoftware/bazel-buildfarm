@@ -73,6 +73,21 @@ public class PersistentWorkerLifecycleTest {
   }
 
   @Test
+  public void idleRetirementRequiresCurrentIdleGeneration() {
+    PersistentWorkerLifecycle lifecycle = new PersistentWorkerLifecycle();
+    PersistentWorker worker = mock(PersistentWorker.class);
+    lifecycle.register(worker);
+    PersistentWorkerLifecycle.Lease lease = lifecycle.lease(worker, "operation-1");
+
+    assertThat(lifecycle.beginRetiringIdle(worker, 0)).isFalse();
+    assertThat(lifecycle.release(lease)).isTrue();
+    assertThat(lifecycle.beginRetiringIdle(worker, 0)).isFalse();
+    assertThat(lifecycle.beginRetiringIdle(worker, lease.generation())).isTrue();
+    assertThat(lifecycle.snapshot(worker).orElseThrow().state())
+        .isEqualTo(PersistentWorkerLifecycle.State.RETIRING);
+  }
+
+  @Test
   public void terminationRemovesWorker() {
     PersistentWorkerLifecycle lifecycle = new PersistentWorkerLifecycle();
     PersistentWorker worker = mock(PersistentWorker.class);

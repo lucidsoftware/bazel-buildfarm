@@ -14,11 +14,23 @@
 
 package persistent.bazel.client;
 
+import java.time.Duration;
+import org.apache.commons.pool2.impl.EvictionPolicy;
 import persistent.common.CommonsPool;
 
 /** Specializes CommmonsPool for PersistentWorker */
 public class CommonsWorkerPool extends CommonsPool<WorkerKey, PersistentWorker> {
   public CommonsWorkerPool(WorkerSupervisor supervisor, int maxPerKey) {
     super(supervisor, maxPerKey);
+  }
+
+  public CommonsWorkerPool(
+      WorkerSupervisor supervisor,
+      int maxPerKey,
+      int maxTotal,
+      int minIdlePerKey,
+      Duration evictionInterval,
+      EvictionPolicy<PersistentWorker> evictionPolicy) {
+    super(supervisor, maxPerKey, maxTotal, minIdlePerKey, evictionInterval, evictionPolicy);
   }
 }

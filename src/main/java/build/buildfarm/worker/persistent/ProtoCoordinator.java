@@ -14,6 +14,7 @@
 
 package build.buildfarm.worker.persistent;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 
@@ -25,6 +26,7 @@ import com.google.protobuf.util.Durations;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
@@ -107,9 +109,22 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   private ProtoCoordinator(
       WorkerSupervisor supervisor,
       int maxWorkersPerKey,
+      PersistentWorkers settings,
       PersistentWorkerLifecycle lifecycle,
       PersistentWorkerIdleMonitor idleMonitor) {
-    super(new CommonsWorkerPool(supervisor, maxWorkersPerKey));
+    super(
+        new CommonsWorkerPool(
+            supervisor,
+            maxWorkersPerKey,
+            settings.getMaxWorkersTotal(),
+            settings.getWarmIdleWorkersPerKey(),
+            settings.getIdleRetirementMode() == PersistentWorkers.IdleRetirementMode.ENABLED
+                ? Duration.ofSeconds(settings.getIdleCheckIntervalSeconds())
+                : Duration.ofMillis(-1),
+            new PersistentWorkerEvictionPolicy(
+                lifecycle,
+                Duration.ofSeconds(settings.getIdleTimeoutSeconds()),
+                settings.getWarmIdleWorkersPerKey())));
     this.lifecycle = lifecycle;
     this.idleMonitor = idleMonitor;
   }
@@ -123,6 +138,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   }
 
   public static ProtoCoordinator ofCommonsPool(int maxWorkersPerKey, PersistentWorkers settings) {
+    validateSettings(maxWorkersPerKey, settings);
     PersistentWorkerLifecycle lifecycle = new PersistentWorkerLifecycle();
     PersistentWorkerIdleMonitor idleMonitor = PersistentWorkerIdleMonitor.from(settings, lifecycle);
     WorkerSupervisor loadToolsOnCreate =
@@ -177,17 +193,38 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
           @Override
           public void destroyObject(WorkerKey key, PooledObject<PersistentWorker> pooled) {
-            idleMonitor.onUnavailable(pooled.getObject());
-            lifecycle.beginRetiring(pooled.getObject());
+            PersistentWorker worker = pooled.getObject();
+            idleMonitor.onUnavailable(worker);
+            lifecycle.beginRetiring(worker);
             try {
               super.destroyObject(key, pooled);
             } finally {
-              lifecycle.terminated(pooled.getObject());
-              PersistentWorkerMetrics.workerDestroyed(pooled.getObject());
+              lifecycle.terminated(worker);
+              PersistentWorkerMetrics.workerDestroyed(worker);
             }
           }
         };
-    return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey, lifecycle, idleMonitor);
+    return new ProtoCoordinator(
+        loadToolsOnCreate, maxWorkersPerKey, settings, lifecycle, idleMonitor);
+  }
+
+  private static void validateSettings(int maxWorkersPerKey, PersistentWorkers settings) {
+    checkNotNull(settings);
+    checkNotNull(settings.getIdleRetirementMode());
+    checkArgument(maxWorkersPerKey > 0, "maxWorkersPerKey must be positive");
+    checkArgument(
+        settings.getMaxWorkersTotal() == -1 || settings.getMaxWorkersTotal() > 0,
+        "maxWorkersTotal must be positive or -1");
+    checkArgument(
+        settings.getWarmIdleWorkersPerKey() >= 0
+            && settings.getWarmIdleWorkersPerKey() <= maxWorkersPerKey,
+        "warmIdleWorkersPerKey must be between zero and maxWorkersPerKey");
+    checkArgument(settings.getIdleTimeoutSeconds() > 0, "idleTimeoutSeconds must be positive");
+    if (settings.getIdleRetirementMode() == PersistentWorkers.IdleRetirementMode.ENABLED) {
+      checkArgument(
+          settings.getIdleCheckIntervalSeconds() > 0,
+          "idleCheckIntervalSeconds must be positive when idle retirement is enabled");
+    }
   }
 
   @Override
