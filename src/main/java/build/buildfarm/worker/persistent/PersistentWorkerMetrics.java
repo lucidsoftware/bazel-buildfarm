@@ -48,6 +48,7 @@ final class PersistentWorkerMetrics {
   static final String DESTROY_POOL = "pool";
   static final String DESTROY_REQUEST_FAILURE = "request_failure";
   static final String DESTROY_TIMEOUT = "timeout";
+  static final String DESTROY_IDLE_TIMEOUT = "idle_timeout";
   static final String DESTROY_UNEXPECTED_EXIT = "unexpected_exit";
 
   private static final double[] TIME_BUCKETS = {

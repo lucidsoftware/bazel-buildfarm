@@ -62,25 +62,20 @@ public class PersistentExecutor {
   private static final String SCALAC_EXEC_NAME = "Scalac";
   private static final String JAVAC_EXEC_NAME = "JavaBuilder";
 
-  // How many workers can exist at once for a given WorkerKey
-  // There may be multiple WorkerKeys per mnemonic,
-  //  e.g. if builds are run with different tool fingerprints
-  private static final int defaultMaxWorkersPerKey = 6;
-
   private static ProtoCoordinator createCoordinator() {
     PersistentWorkers settings = BuildfarmConfigs.getInstance().getWorker().getPersistentWorkers();
-    return ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey(), settings);
+    return ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey(settings), settings);
   }
 
-  private static int getMaxWorkersPerKey() {
+  private static int getMaxWorkersPerKey(PersistentWorkers settings) {
     try {
       return Integer.parseInt(System.getenv("BUILDFARM_MAX_WORKERS_PER_KEY"));
     } catch (Exception ignored) {
       log.info(
           "Could not get env var BUILDFARM_MAX_WORKERS_PER_KEY; defaulting to "
-              + defaultMaxWorkersPerKey);
+              + settings.getMaxWorkersPerKey());
     }
-    return defaultMaxWorkersPerKey;
+    return settings.getMaxWorkersPerKey();
   }
 
   /**
