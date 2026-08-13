@@ -148,6 +148,12 @@ final class PersistentWorkerMetrics {
           .labelNames("kind")
           .help("Lifecycle callbacks ignored because their worker lease was no longer current.")
           .register();
+  private static final Counter idleCandidates =
+      Counter.build()
+          .name("persistent_worker_idle_candidates_total")
+          .labelNames("mode")
+          .help("Generation-validated persistent workers reaching the configured idle timeout.")
+          .register();
 
   private enum State {
     NEW,
@@ -224,6 +230,10 @@ final class PersistentWorkerMetrics {
 
   static void staleLifecycleCallback(String kind) {
     staleLifecycleCallbacks.labels(kind).inc();
+  }
+
+  static void idleCandidate(String mode) {
+    idleCandidates.labels(mode).inc();
   }
 
   static void workerStarted(PersistentWorker worker) {

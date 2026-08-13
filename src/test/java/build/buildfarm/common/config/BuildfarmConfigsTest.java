@@ -1,5 +1,6 @@
 package build.buildfarm.common.config;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 
@@ -7,6 +8,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import javax.naming.ConfigurationException;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -73,5 +75,21 @@ public class BuildfarmConfigsTest {
     assertNotNull(configs);
     assertNotNull(configs.getServer());
     assertNotNull(configs.getBackplane());
+  }
+
+  @Test
+  public void loadConfigs_withPersistentWorkerIdleShadowMode_parsesCorrectly() throws IOException {
+    Path configFile = tempDir.resolve("persistent-workers.yaml");
+    String yamlContent =
+        "worker:\n"
+            + "  persistentWorkers:\n"
+            + "    idleRetirementMode: SHADOW\n"
+            + "    idleTimeoutSeconds: 120\n";
+    Files.write(configFile, yamlContent.getBytes());
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+    PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
+    assertEquals(PersistentWorkers.IdleRetirementMode.SHADOW, settings.getIdleRetirementMode());
+    assertEquals(120L, settings.getIdleTimeoutSeconds());
   }
 }
