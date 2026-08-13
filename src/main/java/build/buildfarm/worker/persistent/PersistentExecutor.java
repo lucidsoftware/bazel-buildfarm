@@ -48,7 +48,8 @@ import persistent.bazel.client.WorkerKey;
  */
 @Log
 public class PersistentExecutor {
-  private static final ProtoCoordinator coordinator = createCoordinator();
+  private static ProtoCoordinator coordinator;
+  private static boolean shutDown;
 
   // TODO load from config (i.e. {worker_root}/persistent)
   public static final Path defaultWorkRootsDir = Path.of("/tmp/worker/persistent/");
@@ -65,6 +66,24 @@ public class PersistentExecutor {
   private static ProtoCoordinator createCoordinator() {
     PersistentWorkers settings = BuildfarmConfigs.getInstance().getWorker().getPersistentWorkers();
     return ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey(settings), settings);
+  }
+
+  private static synchronized ProtoCoordinator getCoordinator() {
+    if (shutDown) {
+      throw new IllegalStateException("persistent worker executor has been shut down");
+    }
+    if (coordinator == null) {
+      coordinator = createCoordinator();
+    }
+    return coordinator;
+  }
+
+  public static synchronized void shutdown() {
+    shutDown = true;
+    if (coordinator != null) {
+      coordinator.close();
+      coordinator = null;
+    }
   }
 
   private static int getMaxWorkersPerKey(PersistentWorkers settings) {
@@ -141,6 +160,7 @@ public class PersistentExecutor {
     // Make Key
 
     WorkerInputs workerFiles = WorkerInputs.from(context, requestArgs);
+    ProtoCoordinator requestCoordinator = getCoordinator();
 
     Path binary = Path.of(workerExecCmd.getFirst());
     if (!workerFiles.containsTool(binary) && !binary.isAbsolute()) {
@@ -161,7 +181,7 @@ public class PersistentExecutor {
     long persistentWorkerRequestStarted = PersistentWorkerMetrics.startTimer();
     long toolSetupStarted = PersistentWorkerMetrics.startTimer();
     try {
-      coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
+      requestCoordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
     } catch (IOException | RuntimeException e) {
       PersistentWorkerMetrics.observeRequest(
           PersistentWorkerMetrics.OUTCOME_TOOL_SETUP_FAILURE, persistentWorkerRequestStarted);
@@ -204,7 +224,7 @@ public class PersistentExecutor {
     WorkResponse response;
     String stdErr = "";
     try {
-      ResponseCtx fullResponse = coordinator.runRequest(key, requestCtx);
+      ResponseCtx fullResponse = requestCoordinator.runRequest(key, requestCtx);
 
       response = fullResponse.response;
       stdErr = fullResponse.errorString;

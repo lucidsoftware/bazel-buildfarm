@@ -78,6 +78,7 @@ import build.buildfarm.worker.PutOperationStage;
 import build.buildfarm.worker.ReportResultStage;
 import build.buildfarm.worker.SuperscalarPipelineStage;
 import build.buildfarm.worker.cgroup.Group;
+import build.buildfarm.worker.persistent.PersistentExecutor;
 import build.buildfarm.worker.resources.LocalResourceSet;
 import build.buildfarm.worker.resources.LocalResourceSet.PoolResource;
 import build.buildfarm.worker.resources.LocalResourceSetUtils;
@@ -968,6 +969,7 @@ public final class Worker extends LoggingMain {
         interrupted = true;
       }
     }
+    PersistentExecutor.shutdown();
     healthStatusManager.setStatus(
         HealthStatusManager.SERVICE_NAME_ALL_SERVICES, ServingStatus.NOT_SERVING);
     healthCheckMetric.labels("stop").inc();
