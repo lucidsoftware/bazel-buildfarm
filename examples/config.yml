@@ -172,6 +172,10 @@ worker:
     amount: 4 # for an A30 MiG in full splay
   persistentWorkerActionMnemonicAllowlist:
   - '*'
+  persistentWorkers:
+    # SHADOW reports workers that have remained idle for the timeout, but never retires them.
+    idleRetirementMode: DISABLED
+    idleTimeoutSeconds: 900
 executionWrappers:
   cgroups2: /app/build_buildfarm/cgexec-wrapper
   unshare: /usr/bin/unshare

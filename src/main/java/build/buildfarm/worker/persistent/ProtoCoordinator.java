@@ -17,6 +17,7 @@ package build.buildfarm.worker.persistent;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 
+import build.buildfarm.common.config.PersistentWorkers;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
@@ -55,6 +56,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
 
   @VisibleForTesting final PersistentWorkerLifecycle lifecycle;
+  private final PersistentWorkerIdleMonitor idleMonitor;
 
   private record PendingRequest(PersistentWorkerLifecycle.Lease lease, RequestTimeoutHandler task) {
     private PendingRequest {
@@ -99,12 +101,17 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   public ProtoCoordinator(CommonsWorkerPool workerPool) {
     super(workerPool);
     lifecycle = new PersistentWorkerLifecycle();
+    idleMonitor = PersistentWorkerIdleMonitor.disabled(lifecycle);
   }
 
   private ProtoCoordinator(
-      WorkerSupervisor supervisor, int maxWorkersPerKey, PersistentWorkerLifecycle lifecycle) {
+      WorkerSupervisor supervisor,
+      int maxWorkersPerKey,
+      PersistentWorkerLifecycle lifecycle,
+      PersistentWorkerIdleMonitor idleMonitor) {
     super(new CommonsWorkerPool(supervisor, maxWorkersPerKey));
     this.lifecycle = lifecycle;
+    this.idleMonitor = idleMonitor;
   }
 
   // We copy tool inputs from the shared WorkerKey tools directory into our worker exec root,
@@ -112,7 +119,12 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   //    and presumably there might be writes to tool inputs?
   // Tool inputs which are absolute-paths (e.g. /usr/bin/...) are not affected
   public static ProtoCoordinator ofCommonsPool(int maxWorkersPerKey) {
+    return ofCommonsPool(maxWorkersPerKey, new PersistentWorkers());
+  }
+
+  public static ProtoCoordinator ofCommonsPool(int maxWorkersPerKey, PersistentWorkers settings) {
     PersistentWorkerLifecycle lifecycle = new PersistentWorkerLifecycle();
+    PersistentWorkerIdleMonitor idleMonitor = PersistentWorkerIdleMonitor.from(settings, lifecycle);
     WorkerSupervisor loadToolsOnCreate =
         new WorkerSupervisor() {
           @Override
@@ -144,6 +156,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             try {
               PersistentWorker worker = new PersistentWorker(workerKey, workerExecDir);
               lifecycle.register(worker);
+              idleMonitor.onIdle(worker);
               PersistentWorkerMetrics.workerStarted(worker);
               return worker;
             } finally {
@@ -164,6 +177,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
           @Override
           public void destroyObject(WorkerKey key, PooledObject<PersistentWorker> pooled) {
+            idleMonitor.onUnavailable(pooled.getObject());
             lifecycle.beginRetiring(pooled.getObject());
             try {
               super.destroyObject(key, pooled);
@@ -173,7 +187,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             }
           }
         };
-    return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey, lifecycle);
+    return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey, lifecycle, idleMonitor);
   }
 
   @Override
@@ -210,6 +224,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
     PersistentWorkerMetrics.workerBorrowed(worker);
     PersistentWorkerLifecycle.Lease lease = lifecycle.lease(worker, requestId(request));
+    idleMonitor.onUnavailable(worker);
     boolean postWorkCleanupCalled = false;
     try {
       request.setOutcome(PersistentWorkerMetrics.OUTCOME_INPUT_SETUP_FAILURE);
@@ -238,6 +253,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       checkState(
           lifecycle.release(lease), "persistent worker lease changed before a successful return");
       workerPool.release(workerKey, worker);
+      idleMonitor.onIdle(worker);
       PersistentWorkerMetrics.workerReturned(worker);
       request.setOutcome(completedOutcome);
       return responseAfterCleanup;
@@ -260,6 +276,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
               ? PersistentWorkerMetrics.DESTROY_TIMEOUT
               : PersistentWorkerMetrics.DESTROY_REQUEST_FAILURE);
       lifecycle.beginRetiring(lease);
+      idleMonitor.onUnavailable(worker);
       try {
         workerPool.invalidate(workerKey, worker);
       } catch (Exception invalidateEx) {

@@ -65,6 +65,7 @@ public class Worker {
   private boolean compressedBlobTransfer = false;
   private Set<String> persistentWorkerActionMnemonicAllowlist = Set.of("*");
   private Set<String> ignoreMarketExecutionMnemonics = Set.of("TestRunner");
+  private PersistentWorkers persistentWorkers = new PersistentWorkers();
   // These limited resources are only for the individual worker.
   // An example would be hardware resources such as GPUs.
   // If you want GPU actions to run exclusively, define a single GPU resource.
