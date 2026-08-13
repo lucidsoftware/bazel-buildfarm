@@ -66,7 +66,7 @@ public class ProtoCoordinatorTest {
   @After
   public void shutdownSchedulers() {
     for (ProtoCoordinator protoCoordinator : coordinators) {
-      protoCoordinator.timeoutScheduler.shutdownNow();
+      protoCoordinator.close();
     }
     coordinators.clear();
   }
@@ -341,6 +341,17 @@ public class ProtoCoordinatorTest {
   }
 
   @Test
+  public void closeShutsDownPoolAndTimeoutScheduler() {
+    CommonsWorkerPool workerPool = mock(CommonsWorkerPool.class);
+    ProtoCoordinator protoCoordinator = new ProtoCoordinator(workerPool);
+
+    protoCoordinator.close();
+
+    verify(workerPool).close();
+    assertThat(protoCoordinator.timeoutScheduler.isShutdown()).isTrue();
+  }
+
+  @Test
   public void preWorkInit_cleansUpPendingReqsOnCopyFailure() throws Exception {
     ProtoCoordinator protoCoordinator = newCoordinator();
 
@@ -375,7 +386,7 @@ public class ProtoCoordinatorTest {
 
     // Make sure that, despite the error, the request is cleaned up from the map of pending
     // requests
-    assertThat(ProtoCoordinator.hasPendingRequest(request)).isFalse();
+    assertThat(protoCoordinator.hasPendingRequest(request)).isFalse();
   }
   @Test
   public void postWorkCleanup_movesOutputsOnNonZeroExitCode() throws Exception {
