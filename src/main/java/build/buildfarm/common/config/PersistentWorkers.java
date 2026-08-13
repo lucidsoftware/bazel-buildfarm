@@ -31,4 +31,5 @@ public class PersistentWorkers {
   private IdleRetirementMode idleRetirementMode = IdleRetirementMode.DISABLED;
   private long idleTimeoutSeconds = 900;
   private long idleCheckIntervalSeconds = 30;
+  private long gracefulTerminationSeconds = 5;
 }

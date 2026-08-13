@@ -155,6 +155,11 @@ final class PersistentWorkerMetrics {
           .labelNames("mode")
           .help("Generation-validated persistent workers reaching the configured idle timeout.")
           .register();
+  private static final Counter terminationFailures =
+      Counter.build()
+          .name("persistent_worker_termination_failures_total")
+          .help("Persistent-worker process trees not confirmed terminated within the bound.")
+          .register();
 
   private enum State {
     NEW,
@@ -235,6 +240,10 @@ final class PersistentWorkerMetrics {
 
   static void idleCandidate(String mode) {
     idleCandidates.labels(mode).inc();
+  }
+
+  static void terminationFailure() {
+    terminationFailures.inc();
   }
 
   static void workerStarted(PersistentWorker worker) {
