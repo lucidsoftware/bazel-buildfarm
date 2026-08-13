@@ -55,7 +55,8 @@ import persistent.bazel.client.WorkerSupervisor;
  * </ol>
  */
 @Log
-public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool> {
+public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool>
+    implements AutoCloseable {
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
 
   @VisibleForTesting final PersistentWorkerLifecycle lifecycle;
@@ -68,11 +69,11 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     }
   }
 
-  private static final ConcurrentHashMap<RequestCtx, PendingRequest> pendingReqs =
+  private final ConcurrentHashMap<RequestCtx, PendingRequest> pendingReqs =
       new ConcurrentHashMap<>();
 
   @VisibleForTesting
-  static boolean hasPendingRequest(RequestCtx request) {
+  boolean hasPendingRequest(RequestCtx request) {
     return pendingReqs.containsKey(request);
   }
 
@@ -261,6 +262,19 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     } catch (IOException e) {
       log.log(Level.WARNING, "Could not remove persistent worker exec root " + workerExecRoot, e);
     }
+  }
+
+  @Override
+  public void close() {
+    idleMonitor.close();
+    for (PendingRequest pendingRequest : pendingReqs.values()) {
+      if (pendingRequest.task().future != null) {
+        pendingRequest.task().future.cancel(false);
+      }
+    }
+    pendingReqs.clear();
+    timeoutScheduler.shutdownNow();
+    workerPool.close();
   }
 
   @Override
