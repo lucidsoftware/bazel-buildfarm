@@ -180,6 +180,7 @@ worker:
     idleRetirementMode: DISABLED
     idleTimeoutSeconds: 900
     idleCheckIntervalSeconds: 30
+    gracefulTerminationSeconds: 5
 executionWrappers:
   cgroups2: /app/build_buildfarm/cgexec-wrapper
   unshare: /usr/bin/unshare

@@ -14,6 +14,7 @@
 
 package persistent.bazel.processes;
 
+import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.common.collect.ImmutableList;
@@ -22,6 +23,7 @@ import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Optional;
 import org.junit.Assert;
 import org.junit.Test;
@@ -127,5 +129,26 @@ public class PersistentWorkerTest {
     WorkRequest secondRequest =
         WorkRequest.newBuilder().addArguments("3").addArguments("4").setRequestId(0).build();
     assertThrows(IOException.class, () -> worker.doWork(secondRequest));
+  }
+
+  @Test
+  public void terminateWaitsForProcessExit() throws Exception {
+    Path workDir = Files.createTempDirectory("test-workdir-");
+    String filename = "adder-bin_deploy.jar";
+    Path jarPath =
+        ProcessUtils.retrieveFileResource(
+            getClass().getClassLoader(), filename, workDir.resolve(filename));
+    ImmutableList<String> initCmd =
+        ImmutableList.of(
+            JavaProcessWrapper.CURRENT_JVM_COMMAND,
+            "-cp",
+            jarPath.toString(),
+            "adder.Adder",
+            "--persistent_worker");
+    PersistentWorker worker =
+        new PersistentWorker(WorkerUtils.emptyWorkerKey(workDir, initCmd), "worker-dir");
+
+    assertThat(worker.terminate(Duration.ofSeconds(1))).isTrue();
+    assertThat(worker.getExitValue()).isPresent();
   }
 }
