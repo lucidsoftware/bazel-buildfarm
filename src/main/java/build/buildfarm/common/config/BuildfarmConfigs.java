@@ -4,6 +4,7 @@ import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.ExecutionProperties;
 import build.buildfarm.common.ExecutionWrapperProperties;
 import build.buildfarm.common.SystemProcessors;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.devtools.common.options.OptionsParser;
 import com.google.devtools.common.options.OptionsParsingException;
@@ -207,7 +208,7 @@ public final class BuildfarmConfigs {
     adjustRedisUri(configs);
   }
 
-  private static void adjustWorkerConfigs(BuildfarmConfigs configs) {
+  private static void adjustWorkerConfigs(BuildfarmConfigs configs) throws ConfigurationException {
     configs
         .getWorker()
         .setPublicName(
@@ -224,7 +225,38 @@ public final class BuildfarmConfigs {
     adjustExecuteStageWidth(configs);
     adjustInputFetchStageWidth(configs);
 
+    validatePersistentWorkers(configs.getWorker().getPersistentWorkers());
     checkExecutionWrapperAvailability(configs);
+  }
+
+  @VisibleForTesting
+  static void validatePersistentWorkers(PersistentWorkers settings) throws ConfigurationException {
+    if (settings == null) {
+      throw new ConfigurationException("persistentWorkers must be configured");
+    }
+    if (settings.getMaxWorkersPerKey() <= 0) {
+      throw new ConfigurationException("persistentWorkers.maxWorkersPerKey must be positive");
+    }
+    if (settings.getMaxWorkersTotal() != -1 && settings.getMaxWorkersTotal() <= 0) {
+      throw new ConfigurationException("persistentWorkers.maxWorkersTotal must be positive or -1");
+    }
+    if (settings.getWarmIdleWorkersPerKey() < 0
+        || settings.getWarmIdleWorkersPerKey() > settings.getMaxWorkersPerKey()) {
+      throw new ConfigurationException(
+          "persistentWorkers.warmIdleWorkersPerKey must be between zero and maxWorkersPerKey");
+    }
+    if (settings.getIdleRetirementMode() == null) {
+      throw new ConfigurationException("persistentWorkers.idleRetirementMode must be configured");
+    }
+    if (settings.getIdleTimeoutSeconds() <= 0) {
+      throw new ConfigurationException("persistentWorkers.idleTimeoutSeconds must be positive");
+    }
+    if (settings.getIdleRetirementMode() == PersistentWorkers.IdleRetirementMode.ENABLED
+        && settings.getIdleCheckIntervalSeconds() <= 0) {
+      throw new ConfigurationException(
+          "persistentWorkers.idleCheckIntervalSeconds must be positive when idle retirement is"
+              + " enabled");
+    }
   }
 
   private static void adjustExecuteStageWidth(BuildfarmConfigs configs) {

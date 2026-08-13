@@ -41,7 +41,7 @@ final class PersistentWorkerIdleMonitor implements AutoCloseable {
 
   static PersistentWorkerIdleMonitor from(
       PersistentWorkers settings, PersistentWorkerLifecycle lifecycle) {
-    if (settings.getIdleRetirementMode() == PersistentWorkers.IdleRetirementMode.DISABLED) {
+    if (settings.getIdleRetirementMode() != PersistentWorkers.IdleRetirementMode.SHADOW) {
       return new PersistentWorkerIdleMonitor(lifecycle);
     }
     return new PersistentWorkerIdleMonitor(
