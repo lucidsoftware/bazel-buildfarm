@@ -45,13 +45,17 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
 
   @Override
   public V borrowObject(K key) throws IOException, InterruptedException {
+    return borrowObject(key, getMaxWaitDuration());
+  }
+
+  @Override
+  public V borrowObject(K key, Duration maxWaitDuration) throws IOException, InterruptedException {
     try {
-      return super.borrowObject(key);
+      return super.borrowObject(key, maxWaitDuration);
     } catch (IOException | InterruptedException checkedException) {
       throw checkedException;
     } catch (NoSuchElementException e) {
-      // Thrown when maxWait expires and no worker is available
-      throw new IOException("Timed out waiting for a persistent worker from the pool", e);
+      throw new PoolExhaustedException("Timed out waiting for an object from the pool", e);
     } catch (Throwable t) {
       throw new RuntimeException("unexpected@<borrowObject>", t);
     }
