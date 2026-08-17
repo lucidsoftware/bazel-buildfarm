@@ -174,8 +174,13 @@ worker:
   persistentWorkers:
     maxWorkersPerKey: 6
     maxWorkersTotal: 100
+    # Planning guard only. Set positive alongside profiles to validate worst-case estimated RSS.
+    maxEstimatedMemoryBytes: -1
     # Fall back to ordinary execution when keyed process capacity remains unavailable.
     poolWaitTimeoutMillis: 250
+    # Profiles match exact internal execution names and override only persistent-process startup.
+    # For example, a Scalac profile can override JAVA_TOOL_OPTIONS with an explicit -Xmx.
+    profiles: []
     warmIdleWorkersPerKey: 0
     # SHADOW only reports candidates. ENABLED retires pool-confirmed idle workers.
     idleRetirementMode: DISABLED

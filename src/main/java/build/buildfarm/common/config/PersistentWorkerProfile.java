@@ -21,8 +21,15 @@ import lombok.Data;
 /** Resource expectations and process-startup overrides for one persistent-worker kind. */
 @Data
 public class PersistentWorkerProfile {
+  /** Stable profile identity; included in the persistent process environment and worker key. */
   private String name = "";
+
+  /** Exact internal execution name, such as {@code Scalac}. */
   private String executionName = "";
+
+  /** Conservative planning estimate for total process RSS; not a runtime-enforced limit. */
   private long estimatedResidentMemoryBytes = 0;
+
+  /** Authoritative overrides applied only when starting the persistent process. */
   private Map<String, String> environment = new HashMap<>();
 }
