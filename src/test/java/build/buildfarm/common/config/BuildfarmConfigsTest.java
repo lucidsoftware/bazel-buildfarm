@@ -458,6 +458,12 @@ public class BuildfarmConfigsTest {
             + "    maxWorkersPerKey: 4\n"
             + "    maxWorkersTotal: 40\n"
             + "    poolWaitTimeoutMillis: 125\n"
+            + "    profiles:\n"
+            + "      - name: scalac\n"
+            + "        executionName: Scalac\n"
+            + "        estimatedResidentMemoryBytes: 6442450944\n"
+            + "        environment:\n"
+            + "          JAVA_TOOL_OPTIONS: '-Xmx4g'\n"
             + "    warmIdleWorkersPerKey: 1\n"
             + "    idleRetirementMode: ENABLED\n"
             + "    idleTimeoutSeconds: 120\n"
@@ -470,6 +476,13 @@ public class BuildfarmConfigsTest {
     assertEquals(4, settings.getMaxWorkersPerKey());
     assertEquals(40, settings.getMaxWorkersTotal());
     assertEquals(125L, settings.getPoolWaitTimeoutMillis());
+    assertEquals(1, settings.getProfiles().size());
+    assertEquals("scalac", settings.getProfiles().getFirst().getName());
+    assertEquals("Scalac", settings.getProfiles().getFirst().getExecutionName());
+    assertEquals(
+        6442450944L, settings.getProfiles().getFirst().getEstimatedResidentMemoryBytes());
+    assertEquals(
+        "-Xmx4g", settings.getProfiles().getFirst().getEnvironment().get("JAVA_TOOL_OPTIONS"));
     assertEquals(1, settings.getWarmIdleWorkersPerKey());
     assertEquals(PersistentWorkers.IdleRetirementMode.ENABLED, settings.getIdleRetirementMode());
     assertEquals(120L, settings.getIdleTimeoutSeconds());
@@ -494,5 +507,34 @@ public class BuildfarmConfigsTest {
 
     assertThrows(
         ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsDuplicateProfileExecutionName() {
+    PersistentWorkers settings = new PersistentWorkers();
+    settings.setProfiles(
+        java.util.List.of(profile("scalac-small", "Scalac"), profile("scalac-large", "Scalac")));
+
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsProfileWithoutMemoryEstimate() {
+    PersistentWorkers settings = new PersistentWorkers();
+    PersistentWorkerProfile profile = profile("scalac", "Scalac");
+    profile.setEstimatedResidentMemoryBytes(0);
+    settings.setProfiles(java.util.List.of(profile));
+
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
+
+  private static PersistentWorkerProfile profile(String name, String executionName) {
+    PersistentWorkerProfile profile = new PersistentWorkerProfile();
+    profile.setName(name);
+    profile.setExecutionName(executionName);
+    profile.setEstimatedResidentMemoryBytes(6L * 1024 * 1024 * 1024);
+    return profile;
   }
 }

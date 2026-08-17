@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import javax.naming.ConfigurationException;
@@ -247,6 +248,48 @@ public final class BuildfarmConfigs {
     if (settings.getPoolWaitTimeoutMillis() < 0) {
       throw new ConfigurationException(
           "persistentWorkers.poolWaitTimeoutMillis must not be negative");
+    }
+    if (settings.getProfiles() == null) {
+      throw new ConfigurationException("persistentWorkers.profiles must be configured");
+    }
+    HashSet<String> profileNames = new HashSet<>();
+    HashSet<String> executionNames = new HashSet<>();
+    for (PersistentWorkerProfile profile : settings.getProfiles()) {
+      if (profile == null) {
+        throw new ConfigurationException("persistentWorkers.profiles must not contain null");
+      }
+      if (profile.getName() == null || profile.getName().isBlank()) {
+        throw new ConfigurationException("persistentWorkers profile name must not be blank");
+      }
+      if (!profileNames.add(profile.getName())) {
+        throw new ConfigurationException(
+            "persistentWorkers profile name must be unique: " + profile.getName());
+      }
+      if (profile.getExecutionName() == null || profile.getExecutionName().isBlank()) {
+        throw new ConfigurationException(
+            "persistentWorkers profile executionName must not be blank: " + profile.getName());
+      }
+      if (!executionNames.add(profile.getExecutionName())) {
+        throw new ConfigurationException(
+            "persistentWorkers profile executionName must be unique: "
+                + profile.getExecutionName());
+      }
+      if (profile.getEstimatedResidentMemoryBytes() <= 0) {
+        throw new ConfigurationException(
+            "persistentWorkers profile estimatedResidentMemoryBytes must be positive: "
+                + profile.getName());
+      }
+      if (profile.getEnvironment() == null) {
+        throw new ConfigurationException(
+            "persistentWorkers profile environment must be configured: " + profile.getName());
+      }
+      for (Map.Entry<String, String> entry : profile.getEnvironment().entrySet()) {
+        if (entry.getKey() == null || entry.getKey().isBlank() || entry.getValue() == null) {
+          throw new ConfigurationException(
+              "persistentWorkers profile environment must have nonblank keys and nonnull values: "
+                  + profile.getName());
+        }
+      }
     }
     if (settings.getWarmIdleWorkersPerKey() < 0
         || settings.getWarmIdleWorkersPerKey() > settings.getMaxWorkersPerKey()) {

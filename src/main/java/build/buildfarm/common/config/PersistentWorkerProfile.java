@@ -14,26 +14,15 @@
 
 package build.buildfarm.common.config;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import lombok.Data;
 
-/** Persistent-worker lifecycle settings. */
+/** Resource expectations and process-startup overrides for one persistent-worker kind. */
 @Data
-public class PersistentWorkers {
-  public enum IdleRetirementMode {
-    DISABLED,
-    SHADOW,
-    ENABLED
-  }
-
-  private int maxWorkersPerKey = 6;
-  private int maxWorkersTotal = 100;
-  private long poolWaitTimeoutMillis = 250;
-  private List<PersistentWorkerProfile> profiles = new ArrayList<>();
-  private int warmIdleWorkersPerKey = 0;
-  private IdleRetirementMode idleRetirementMode = IdleRetirementMode.DISABLED;
-  private long idleTimeoutSeconds = 900;
-  private long idleCheckIntervalSeconds = 30;
-  private long gracefulTerminationSeconds = 5;
+public class PersistentWorkerProfile {
+  private String name = "";
+  private String executionName = "";
+  private long estimatedResidentMemoryBytes = 0;
+  private Map<String, String> environment = new HashMap<>();
 }
