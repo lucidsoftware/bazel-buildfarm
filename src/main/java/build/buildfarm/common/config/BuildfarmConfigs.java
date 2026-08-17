@@ -291,6 +291,7 @@ public final class BuildfarmConfigs {
         }
       }
     }
+    validatePersistentWorkerEstimatedMemory(settings);
     if (settings.getWarmIdleWorkersPerKey() < 0
         || settings.getWarmIdleWorkersPerKey() > settings.getMaxWorkersPerKey()) {
       throw new ConfigurationException(
@@ -311,6 +312,46 @@ public final class BuildfarmConfigs {
     if (settings.getGracefulTerminationSeconds() < 0) {
       throw new ConfigurationException(
           "persistentWorkers.gracefulTerminationSeconds must not be negative");
+    }
+  }
+
+  private static void validatePersistentWorkerEstimatedMemory(PersistentWorkers settings)
+      throws ConfigurationException {
+    long budget = settings.getMaxEstimatedMemoryBytes();
+    if (budget == -1) {
+      return;
+    }
+    if (budget <= 0) {
+      throw new ConfigurationException(
+          "persistentWorkers.maxEstimatedMemoryBytes must be positive or -1");
+    }
+    if (settings.getProfiles().isEmpty()) {
+      throw new ConfigurationException(
+          "persistentWorkers.maxEstimatedMemoryBytes requires at least one profile");
+    }
+    if (settings.getMaxWorkersTotal() == -1) {
+      throw new ConfigurationException(
+          "persistentWorkers.maxEstimatedMemoryBytes requires bounded maxWorkersTotal");
+    }
+    long largestProfileEstimate =
+        settings.getProfiles().stream()
+            .mapToLong(PersistentWorkerProfile::getEstimatedResidentMemoryBytes)
+            .max()
+            .orElseThrow();
+    final long worstCaseEstimate;
+    try {
+      worstCaseEstimate =
+          Math.multiplyExact(largestProfileEstimate, settings.getMaxWorkersTotal());
+    } catch (ArithmeticException e) {
+      throw new ConfigurationException(
+          "persistentWorkers estimated memory calculation exceeds long range");
+    }
+    if (worstCaseEstimate > budget) {
+      throw new ConfigurationException(
+          "persistentWorkers maxWorkersTotal may reserve up to "
+              + worstCaseEstimate
+              + " estimated bytes, exceeding maxEstimatedMemoryBytes="
+              + budget);
     }
   }
 

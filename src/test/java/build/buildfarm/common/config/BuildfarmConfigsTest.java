@@ -457,6 +457,7 @@ public class BuildfarmConfigsTest {
             + "  persistentWorkers:\n"
             + "    maxWorkersPerKey: 4\n"
             + "    maxWorkersTotal: 40\n"
+            + "    maxEstimatedMemoryBytes: 322122547200\n"
             + "    poolWaitTimeoutMillis: 125\n"
             + "    profiles:\n"
             + "      - name: scalac\n"
@@ -475,6 +476,7 @@ public class BuildfarmConfigsTest {
     PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
     assertEquals(4, settings.getMaxWorkersPerKey());
     assertEquals(40, settings.getMaxWorkersTotal());
+    assertEquals(322122547200L, settings.getMaxEstimatedMemoryBytes());
     assertEquals(125L, settings.getPoolWaitTimeoutMillis());
     assertEquals(1, settings.getProfiles().size());
     assertEquals("scalac", settings.getProfiles().getFirst().getName());
@@ -525,6 +527,38 @@ public class BuildfarmConfigsTest {
     PersistentWorkerProfile profile = profile("scalac", "Scalac");
     profile.setEstimatedResidentMemoryBytes(0);
     settings.setProfiles(java.util.List.of(profile));
+
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
+
+  @Test
+  public void validatePersistentWorkers_acceptsEstimatedMemoryWithinBudget() throws Exception {
+    PersistentWorkers settings = new PersistentWorkers();
+    settings.setMaxWorkersTotal(4);
+    settings.setMaxEstimatedMemoryBytes(24L * 1024 * 1024 * 1024);
+    settings.setProfiles(java.util.List.of(profile("scalac", "Scalac")));
+
+    BuildfarmConfigs.validatePersistentWorkers(settings);
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsEstimatedMemoryAboveBudget() {
+    PersistentWorkers settings = new PersistentWorkers();
+    settings.setMaxWorkersTotal(4);
+    settings.setMaxEstimatedMemoryBytes(20L * 1024 * 1024 * 1024);
+    settings.setProfiles(java.util.List.of(profile("scalac", "Scalac")));
+
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsMemoryBudgetWithUnboundedPool() {
+    PersistentWorkers settings = new PersistentWorkers();
+    settings.setMaxWorkersTotal(-1);
+    settings.setMaxEstimatedMemoryBytes(24L * 1024 * 1024 * 1024);
+    settings.setProfiles(java.util.List.of(profile("scalac", "Scalac")));
 
     assertThrows(
         ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));

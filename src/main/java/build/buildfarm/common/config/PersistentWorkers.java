@@ -29,6 +29,8 @@ public class PersistentWorkers {
 
   private int maxWorkersPerKey = 6;
   private int maxWorkersTotal = 100;
+  // Planning guard only; this does not enforce process RSS at runtime.
+  private long maxEstimatedMemoryBytes = -1;
   private long poolWaitTimeoutMillis = 250;
   private List<PersistentWorkerProfile> profiles = new ArrayList<>();
   private int warmIdleWorkersPerKey = 0;
