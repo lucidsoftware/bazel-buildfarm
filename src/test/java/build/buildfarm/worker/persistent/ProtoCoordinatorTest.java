@@ -52,6 +52,7 @@ import org.junit.runners.JUnit4;
 import persistent.bazel.client.CommonsWorkerPool;
 import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkerKey;
+import persistent.common.PoolExhaustedException;
 
 @RunWith(JUnit4.class)
 public class ProtoCoordinatorTest {
@@ -314,6 +315,26 @@ public class ProtoCoordinatorTest {
 
     verify(workerPool).close();
     assertThat(protoCoordinator.timeoutScheduler.isShutdown()).isTrue();
+  }
+
+  @Test
+  public void runRequestUsesBoundedPoolWaitAndPropagatesExhaustion() throws Exception {
+    CommonsWorkerPool workerPool = mock(CommonsWorkerPool.class);
+    java.time.Duration poolWaitTimeout = java.time.Duration.ofMillis(25);
+    ProtoCoordinator protoCoordinator = new ProtoCoordinator(workerPool, poolWaitTimeout);
+    coordinators.add(protoCoordinator);
+    WorkerKey workerKey = mock(WorkerKey.class);
+    RequestCtx request = createRequestDontAddToPendingRequests();
+    PoolExhaustedException exhausted =
+        new PoolExhaustedException("persistent-worker pool exhausted", null);
+    when(workerPool.borrowObject(workerKey, poolWaitTimeout)).thenThrow(exhausted);
+
+    PoolExhaustedException thrown =
+        assertThrows(
+            PoolExhaustedException.class, () -> protoCoordinator.runRequest(workerKey, request));
+
+    assertThat(thrown).isSameInstanceAs(exhausted);
+    verify(workerPool).borrowObject(workerKey, poolWaitTimeout);
   }
 
   @Test

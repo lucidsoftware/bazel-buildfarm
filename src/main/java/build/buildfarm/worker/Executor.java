@@ -75,6 +75,7 @@ import java.util.function.Consumer;
 import java.util.logging.Level;
 import javax.annotation.Nullable;
 import lombok.extern.java.Log;
+import persistent.common.PoolExhaustedException;
 
 @Log
 class Executor {
@@ -82,17 +83,25 @@ class Executor {
   private static final String PERSISTENT_WORKER_ELIGIBLE = "eligible";
   private static final String PERSISTENT_WORKER_MNEMONIC_REJECTED = "mnemonic_rejected";
   private static final String PERSISTENT_WORKER_UNMARKED_EXECUTABLE = "unmarked_executable";
+  private static final String PERSISTENT_WORKER_FALLBACK_POOL_EXHAUSTED = "pool_exhausted";
   private static final Counter persistentWorkerEligibility =
       Counter.build()
           .name("persistent_worker_eligibility_total")
           .labelNames("outcome")
           .help("Persistent-worker eligibility decisions by bounded outcome.")
           .register();
+  private static final Counter persistentWorkerFallbacks =
+      Counter.build()
+          .name("persistent_worker_fallbacks_total")
+          .labelNames("reason")
+          .help("Persistent-worker actions retried through ordinary execution by bounded reason.")
+          .register();
 
   static {
     persistentWorkerEligibility.labels(PERSISTENT_WORKER_ELIGIBLE);
     persistentWorkerEligibility.labels(PERSISTENT_WORKER_MNEMONIC_REJECTED);
     persistentWorkerEligibility.labels(PERSISTENT_WORKER_UNMARKED_EXECUTABLE);
+    persistentWorkerFallbacks.labels(PERSISTENT_WORKER_FALLBACK_POOL_EXHAUSTED);
   }
 
   private final WorkerContext workerContext;
@@ -306,89 +315,33 @@ class Executor {
     log.log(Level.FINER, "Executor: Operation " + operationName + " Executing command");
 
     Command command = executionContext.command;
-    Path workingDirectory = executionContext.execDir;
-    if (!command.getWorkingDirectory().isEmpty()) {
-      workingDirectory = workingDirectory.resolve(command.getWorkingDirectory());
-    }
+    Path workingDirectory =
+        command.getWorkingDirectory().isEmpty()
+            ? executionContext.execDir
+            : executionContext.execDir.resolve(command.getWorkingDirectory());
 
     // similar to the policy selection here
     Map<String, Interpolator> interpolations =
         createInterpolations(
             executionContext.claim, executionContext.queueEntry.getPlatform().getPropertiesList());
 
-    ImmutableList.Builder<String> arguments = ImmutableList.builder();
-
-    // Apply custom PRIORITIZED execution policies BEFORE built-in wrappers
-    for (ExecutionPolicy policy : policies) {
-      if (policy.isPrioritized() && policy.getExecutionWrapper() != null) {
-        arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
-      }
-    }
-
     Code statusCode;
     WorkFilesContext persistentWorkerFilesContext = getPersistentWorkerFilesContext();
-    boolean usePersistentWorker = persistentWorkerFilesContext != null;
-    try (IOResource resource =
-        workerContext.limitExecution(
-            operationName,
-            executionContext.claim.owner(),
-            arguments,
-            executionContext.command,
-            workingDirectory,
-            usePersistentWorker)) {
-      // Apply all other custom execution policies AFTER built-in wrappers
-      for (ExecutionPolicy policy : policies) {
-        if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
-          arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
-        }
-      }
-
-      // Windows requires that relative command programs are absolutized
-      Iterator<String> argumentItr = command.getArgumentsList().iterator();
-      boolean absolutizeExe =
-          BuildfarmConfigs.getInstance().getWorker().isAbsolutizeCommandProgram()
-              && argumentItr.hasNext()
-              && Files.exists(workingDirectory.resolve(command.getArguments(0)));
-      if (absolutizeExe) {
-        Path exe =
-            workingDirectory.resolve(
-                argumentItr.next()); // Get first element, this is the executable
-        arguments.add(exe.toAbsolutePath().normalize().toString());
-      }
-      argumentItr.forEachRemaining(arguments::add);
-
+    try {
       statusCode =
-          executeCommand(
+          executeWithPersistentWorkerFallback(
               operationName,
-              workingDirectory,
-              arguments.build(),
-              command.getEnvironmentVariablesList(),
-              limits,
               persistentWorkerFilesContext,
-              timeout,
-              // executingMetadata.getStdoutStreamName(),
-              // executingMetadata.getStderrStreamName(),
-              executionContext.executeResponse.getResultBuilder());
-
-      // From Bazel Test Encyclopedia:
-      // If the main process of a test exits, but some of its children are still running,
-      // the test runner should consider the run complete and count it as a success or failure
-      // based on the exit code observed from the main process. The test runner may kill any stray
-      // processes. Tests should not leak processes in this fashion.
-      // Based on configuration, we will decide whether remaining resources should be an error.
-      if (workerContext.shouldErrorOperationOnRemainingResources()
-          && resource.isReferenced()
-          && statusCode == Code.OK) {
-        // there should no longer be any references to the resource. Any references will be
-        // killed upon close, but we must error the operation due to improper execution
-        // per the gRPC spec: 'The operation was attempted past the valid range.' Seems
-        // appropriate
-        statusCode = Code.OUT_OF_RANGE;
-        executionContext
-            .executeResponse
-            .getStatusBuilder()
-            .setMessage("command resources were referenced after execution completed");
-      }
+              filesContext ->
+                  executeCommandAttempt(
+                      operationName,
+                      command,
+                      workingDirectory,
+                      limits,
+                      policies,
+                      interpolations,
+                      filesContext,
+                      timeout));
     } catch (IOException e) {
       log.log(Level.SEVERE, format("error executing operation %s", operationName), e);
       executionContext.poller.pause();
@@ -445,6 +398,107 @@ class Executor {
     }
     polling = false;
     return stopwatch.elapsed(MICROSECONDS) - executeUSecs;
+  }
+
+  @FunctionalInterface
+  interface CommandAttempt {
+    Code execute(@Nullable WorkFilesContext persistentWorkerFilesContext)
+        throws IOException, InterruptedException;
+  }
+
+  @VisibleForTesting
+  static Code executeWithPersistentWorkerFallback(
+      String operationName,
+      @Nullable WorkFilesContext persistentWorkerFilesContext,
+      CommandAttempt attempt)
+      throws IOException, InterruptedException {
+    try {
+      return attempt.execute(persistentWorkerFilesContext);
+    } catch (PoolExhaustedException e) {
+      if (persistentWorkerFilesContext == null) {
+        throw e;
+      }
+      persistentWorkerFallbacks.labels(PERSISTENT_WORKER_FALLBACK_POOL_EXHAUSTED).inc();
+      log.log(
+          Level.FINE,
+          "Persistent-worker pool unavailable; retrying through ordinary execution for "
+              + operationName);
+      return attempt.execute(null);
+    }
+  }
+
+  private Code executeCommandAttempt(
+      String operationName,
+      Command command,
+      Path workingDirectory,
+      ResourceLimits limits,
+      Iterable<ExecutionPolicy> policies,
+      Map<String, Interpolator> interpolations,
+      @Nullable WorkFilesContext persistentWorkerFilesContext,
+      Duration timeout)
+      throws IOException, InterruptedException {
+    ImmutableList.Builder<String> arguments = ImmutableList.builder();
+
+    // Apply custom PRIORITIZED execution policies BEFORE built-in wrappers.
+    for (ExecutionPolicy policy : policies) {
+      if (policy.isPrioritized() && policy.getExecutionWrapper() != null) {
+        arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
+      }
+    }
+
+    boolean usePersistentWorker = persistentWorkerFilesContext != null;
+    try (IOResource resource =
+        workerContext.limitExecution(
+            operationName,
+            executionContext.claim.owner(),
+            arguments,
+            command,
+            workingDirectory,
+            usePersistentWorker)) {
+      // Apply all other custom execution policies AFTER built-in wrappers.
+      for (ExecutionPolicy policy : policies) {
+        if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
+          arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
+        }
+      }
+
+      // Windows requires that relative command programs are absolutized.
+      Iterator<String> argumentItr = command.getArgumentsList().iterator();
+      boolean absolutizeExe =
+          BuildfarmConfigs.getInstance().getWorker().isAbsolutizeCommandProgram()
+              && argumentItr.hasNext()
+              && Files.exists(workingDirectory.resolve(command.getArguments(0)));
+      if (absolutizeExe) {
+        Path exe = workingDirectory.resolve(argumentItr.next());
+        arguments.add(exe.toAbsolutePath().normalize().toString());
+      }
+      argumentItr.forEachRemaining(arguments::add);
+
+      Code statusCode =
+          executeCommand(
+              operationName,
+              workingDirectory,
+              arguments.build(),
+              command.getEnvironmentVariablesList(),
+              limits,
+              persistentWorkerFilesContext,
+              timeout,
+              executionContext.executeResponse.getResultBuilder());
+
+      // From Bazel Test Encyclopedia: a completed main process ends the action even if children
+      // remain. Buildfarm may still reject the action when configured to treat leaked resources as
+      // an error.
+      if (workerContext.shouldErrorOperationOnRemainingResources()
+          && resource.isReferenced()
+          && statusCode == Code.OK) {
+        executionContext
+            .executeResponse
+            .getStatusBuilder()
+            .setMessage("command resources were referenced after execution completed");
+        return Code.OUT_OF_RANGE;
+      }
+      return statusCode;
+    }
   }
 
   public void run(ResourceLimits limits) {
@@ -547,9 +601,7 @@ class Executor {
 
   @VisibleForTesting
   static boolean isPersistentWorkerEligible(
-      String actionMnemonic,
-      Collection<String> mnemonicAllowlist,
-      boolean executableIsTool) {
+      String actionMnemonic, Collection<String> mnemonicAllowlist, boolean executableIsTool) {
     return executableIsTool
         && (mnemonicAllowlist.contains("*") || mnemonicAllowlist.contains(actionMnemonic));
   }

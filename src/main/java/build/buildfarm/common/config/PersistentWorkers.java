@@ -27,6 +27,7 @@ public class PersistentWorkers {
 
   private int maxWorkersPerKey = 6;
   private int maxWorkersTotal = 100;
+  private long poolWaitTimeoutMillis = 250;
   private int warmIdleWorkersPerKey = 0;
   private IdleRetirementMode idleRetirementMode = IdleRetirementMode.DISABLED;
   private long idleTimeoutSeconds = 900;

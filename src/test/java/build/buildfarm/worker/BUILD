@@ -19,11 +19,13 @@ java_test(
     plugins = ["//src/main/java/build/buildfarm/common:lombok"],
     test_class = "build.buildfarm.AllTests",
     deps = [
+        "//persistentworkers/src/main/java/persistent/common:persistent-common",
         "//src/main/java/build/buildfarm/cas",
         "//src/main/java/build/buildfarm/common",
         "//src/main/java/build/buildfarm/common/config",
         "//src/main/java/build/buildfarm/instance",
         "//src/main/java/build/buildfarm/worker",
+        "//src/main/java/build/buildfarm/worker/persistent",
         "//src/main/java/build/buildfarm/worker/resources",
         "//src/main/protobuf/build/buildfarm/v1test:buildfarm_java_proto",
         "//src/test/java/build/buildfarm:test_runner",

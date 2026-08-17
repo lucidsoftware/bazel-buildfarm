@@ -15,9 +15,17 @@
 package build.buildfarm.worker;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.mock;
 
+import build.buildfarm.worker.persistent.WorkFilesContext;
 import com.google.common.collect.ImmutableList;
+import com.google.rpc.Code;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.Test;
+import persistent.common.PoolExhaustedException;
 
 public class ExecutorTest {
   @Test
@@ -48,5 +56,45 @@ public class ExecutorTest {
             Executor.isPersistentWorkerEligible(
                 "TsProject", ImmutableList.of("ScalaCompile"), true))
         .isFalse();
+  }
+
+  @Test
+  public void poolExhaustionRetriesThroughOrdinaryExecution() throws Exception {
+    WorkFilesContext persistentContext = mock(WorkFilesContext.class);
+    List<WorkFilesContext> attempts = new ArrayList<>();
+
+    Code result =
+        Executor.executeWithPersistentWorkerFallback(
+            "operation",
+            persistentContext,
+            context -> {
+              attempts.add(context);
+              if (context != null) {
+                throw new PoolExhaustedException("pool exhausted", null);
+              }
+              return Code.OK;
+            });
+
+    assertThat(result).isEqualTo(Code.OK);
+    assertThat(attempts).containsExactly(persistentContext, null).inOrder();
+  }
+
+  @Test
+  public void nonCapacityFailureDoesNotRetryThroughOrdinaryExecution() {
+    WorkFilesContext persistentContext = mock(WorkFilesContext.class);
+    List<WorkFilesContext> attempts = new ArrayList<>();
+
+    assertThrows(
+        IOException.class,
+        () ->
+            Executor.executeWithPersistentWorkerFallback(
+                "operation",
+                persistentContext,
+                context -> {
+                  attempts.add(context);
+                  throw new IOException("worker setup failed");
+                }));
+
+    assertThat(attempts).containsExactly(persistentContext);
   }
 }

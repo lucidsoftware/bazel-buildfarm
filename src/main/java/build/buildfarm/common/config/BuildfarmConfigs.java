@@ -244,6 +244,10 @@ public final class BuildfarmConfigs {
     if (settings.getMaxWorkersTotal() != -1 && settings.getMaxWorkersTotal() <= 0) {
       throw new ConfigurationException("persistentWorkers.maxWorkersTotal must be positive or -1");
     }
+    if (settings.getPoolWaitTimeoutMillis() < 0) {
+      throw new ConfigurationException(
+          "persistentWorkers.poolWaitTimeoutMillis must not be negative");
+    }
     if (settings.getWarmIdleWorkersPerKey() < 0
         || settings.getWarmIdleWorkersPerKey() > settings.getMaxWorkersPerKey()) {
       throw new ConfigurationException(
