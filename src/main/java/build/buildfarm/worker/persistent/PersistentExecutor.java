@@ -98,6 +98,18 @@ public class PersistentExecutor {
     return settings.getMaxWorkersPerKey();
   }
 
+  @VisibleForTesting
+  static ImmutableMap<String, String> applyProfileEnvironment(
+      PersistentWorkers settings,
+      String executionName,
+      ImmutableMap<String, String> actionEnvironment) {
+    return PersistentWorkerProfileResolver.resolve(settings, executionName)
+        .map(
+            profile ->
+                PersistentWorkerProfileResolver.applyEnvironment(profile, actionEnvironment))
+        .orElse(actionEnvironment);
+  }
+
   /**
    * Run some Action on a Persistent Worker.
    *
@@ -145,12 +157,15 @@ public class PersistentExecutor {
     // (@wiwa) I believe the reason has to do with JavaBuilder workers not relying on env vars,
     // as compared to rules_scala, only reading info from the argslist of each command.
     // That would mean the Java worker keys should be invariant to the env vars we see.
-    ImmutableMap<String, String> env;
+    ImmutableMap<String, String> actionEnv;
     if (executionName.equals(JAVAC_EXEC_NAME)) {
-      env = ImmutableMap.of();
+      actionEnv = ImmutableMap.of();
     } else {
-      env = envVars;
+      actionEnv = envVars;
     }
+    PersistentWorkers settings = BuildfarmConfigs.getInstance().getWorker().getPersistentWorkers();
+    ImmutableMap<String, String> env =
+        applyProfileEnvironment(settings, executionName, actionEnv);
 
     int requestArgsIdx = initCmd.size();
     ImmutableList<String> workerExecCmd = initCmd;
