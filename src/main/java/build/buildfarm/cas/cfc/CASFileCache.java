@@ -564,13 +564,21 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     }
 
     @Override
-    public @Nullable Entry safeStorageRemoval(String key) throws IOException {
-      return CASFileCache.this.safeStorageRemoval(key);
+    public @Nullable Entry safeStorageRemoval(String key, long size) throws IOException {
+      Digest digest = entryDigest(key, size);
+      if (digest == null) {
+        throw new IOException("could not recover digest for storage key " + key);
+      }
+      return CASFileCache.this.safeStorageRemoval(digest, key);
     }
 
     @Override
-    public void deleteExpiredKey(String key) throws IOException {
-      CASFileCache.this.deleteExpiredKey(key);
+    public void deleteExpiredKey(String key, long size) throws IOException {
+      Digest digest = entryDigest(key, size);
+      if (digest == null) {
+        throw new IOException("could not recover digest for expired key " + key);
+      }
+      CASFileCache.this.deleteExpiredKey(digest, key);
     }
 
     @Override
@@ -2066,7 +2074,12 @@ public abstract class CASFileCache implements ContentAddressableStorage {
                   file.getFileName(), key));
           continue;
         }
-        Path path = entryPathStrategy.getPath(key);
+        Digest digest = entryDigest(key, entry.size());
+        if (digest == null) {
+          log.log(Level.WARNING, format("snapshot %s has unparseable key %s; skipping", file, key));
+          continue;
+        }
+        Path path = entryPathStrategy.getPath(digest, key);
         if (key.endsWith("_dir")) {
           if (files.remove(path)) {
             processRootFile(onStartPut, path, entry, /* fileKey= */ null, computeDirs, deleteFiles);

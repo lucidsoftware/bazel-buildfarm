@@ -74,13 +74,15 @@ The reconstruction then adds the independent dynamic-width, Bzlmod, JSON logging
 registration, Redis backoff, provision-queue metric, and cgroup-v2 features. Upstreamed pointer
 features require no reconstruction commit because they are already in the base.
 
-## Known verification concern
+## Verification notes
 
-The CAS concurrency series adds JCTools and changes the Maven dependency graph. The merged
-`maven_install.json` must be repinned against the final reconstructed `MODULE.bazel`. During the
-port, Maven Central returned HTTP 429 for transitive POM requests, so a clean repin and Bazel test
-run are mandatory before this branch is considered deployable. This is an external dependency
-resolution failure, not a passing test result.
+The CAS concurrency series adds JCTools and changes the Maven dependency graph. The reconstructed
+branch's `maven_install.json` was repinned against its final `MODULE.bazel`, and Bazel validates the
+resulting lock signature. Maven Central returned HTTP 429 for some transitive POM requests during
+verification, so the repin used Google's read-only Maven Central mirror and restored canonical
+Central URLs in the checked-in lockfile. Targeted CAS, worker, shard-worker, persistent-worker, and
+cgroup test suites pass; the test invocation used a temporary local override of grpc-java whose
+only change was the same repository mirror substitution. That override is not part of the branch.
 
 ## Suggested upstream order
 

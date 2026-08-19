@@ -1417,7 +1417,7 @@ final class EvictorShard extends EvictorShardPad1 {
         log.log(
             Level.SEVERE, format("invalidateWriteForKey failed for %s; continuing", victim.key), e);
       }
-      Entry removedEntry = backing.safeStorageRemoval(victim.key);
+      Entry removedEntry = backing.safeStorageRemoval(victim.key, victim.size);
       detached = true;
       if (removedEntry != null && removedEntry != victim) {
         // Defensive race-loss path: a different Entry replaced ours between offer and removal.
@@ -1444,7 +1444,7 @@ final class EvictorShard extends EvictorShardPad1 {
       if (!victim.key.endsWith("_dir")) {
         backing.onDigestFullyExpired(victim.key, victim.size);
       }
-      submitAsyncCleanup(victim.key);
+      submitAsyncCleanup(victim.key, victim.size);
       victim.completeEviction();
       // Count the eviction only after the full success path. removedBytes/removedCount
       // bytes accounting is incremented above so shardBytes backpressure unblocks promptly,
@@ -1489,12 +1489,12 @@ final class EvictorShard extends EvictorShardPad1 {
     }
   }
 
-  private void submitAsyncCleanup(String key) {
+  private void submitAsyncCleanup(String key, long size) {
     try {
       asyncCleanupExecutor.execute(
           () -> {
             try {
-              backing.deleteExpiredKey(key);
+              backing.deleteExpiredKey(key, size);
             } catch (NoSuchFileException e) {
               // Already gone — fine.
             } catch (IOException e) {
@@ -1506,7 +1506,7 @@ final class EvictorShard extends EvictorShardPad1 {
       // log discipline rather than silently swallowing — if the inline delete fails the
       // _removed sibling leaks, and operators want to see why.
       try {
-        backing.deleteExpiredKey(key);
+        backing.deleteExpiredKey(key, size);
       } catch (NoSuchFileException ignored) {
         // Already gone — fine.
       } catch (IOException ioe) {

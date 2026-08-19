@@ -44,13 +44,13 @@ interface CasEvictorBacking {
    * that writer's {@code safeStorageInsertion} acquires, so that writer's {@code Files.createLink}
    * and the evictor's {@code createLink+delete} dance cannot interleave incoherently.
    */
-  CASFileCache.@Nullable Entry safeStorageRemoval(String key) throws IOException;
+  CASFileCache.@Nullable Entry safeStorageRemoval(String key, long size) throws IOException;
 
   /**
    * Delete the {@code <key>_removed} sibling left behind by {@link #safeStorageRemoval}. Dispatched
    * by the evictor to its async-cleanup executor; on shutdown-race the evictor may run this inline.
    */
-  void deleteExpiredKey(String key) throws IOException;
+  void deleteExpiredKey(String key, long size) throws IOException;
 
   /**
    * Synchronous portion of the delegate-fallback upload: open an InputStream against the

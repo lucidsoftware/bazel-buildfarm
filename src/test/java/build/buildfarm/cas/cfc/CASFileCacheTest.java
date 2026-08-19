@@ -268,7 +268,7 @@ class CASFileCacheTest {
     Digest blobDigest = DIGEST_UTIL.compute(blob);
     blobs.put(blobDigest, blob);
     String key = CASFileCache.getKey(blobDigest, true);
-    Path path = fileCache.getPath(key);
+    Path path = fileCache.getPath(blobDigest, key);
     Files.write(path, blob.toByteArray());
     EvenMoreFiles.setReadOnlyPerms(path, true, fileStore);
 
@@ -432,13 +432,13 @@ class CASFileCacheTest {
     // Two blobs with different sizes, both smaller than one block.
     ByteString blob1 = ByteString.copyFromUtf8("small");
     Digest digest1 = DIGEST_UTIL.compute(blob1);
-    Path path1 = fileCache.getPath(fileCache.getKey(digest1, false));
+    Path path1 = fileCache.getPath(digest1, fileCache.getKey(digest1, false));
     Files.write(path1, blob1.toByteArray());
     EvenMoreFiles.setReadOnlyPerms(path1, false, fileStore);
 
     ByteString blob2 = ByteString.copyFromUtf8("another small blob");
     Digest digest2 = DIGEST_UTIL.compute(blob2);
-    Path path2 = fileCache.getPath(fileCache.getKey(digest2, false));
+    Path path2 = fileCache.getPath(digest2, fileCache.getKey(digest2, false));
     Files.write(path2, blob2.toByteArray());
     EvenMoreFiles.setReadOnlyPerms(path2, false, fileStore);
 
@@ -775,7 +775,7 @@ class CASFileCacheTest {
 
     UUID writeId = UUID.randomUUID();
     String key = fileCache.getKey(digest, false);
-    Path writePath = fileCache.getPath(key).resolveSibling(key + "." + writeId);
+    Path writePath = fileCache.getPath(digest, key).resolveSibling(key + "." + writeId);
     Files.write(writePath, content.toByteArray());
     Write write =
         fileCache.getWrite(
@@ -2067,12 +2067,22 @@ class CASFileCacheTest {
               "charger-" + t));
     }
     for (int t = 0; t < readerThreads; t++) {
+      final int readerIndex = t;
       threads.add(
           new Thread(
               () -> {
-                try {
+                try (InputStream initial =
+                    fileCache.newInput(
+                        Compressor.Value.IDENTITY,
+                        readableDigests.get(readerIndex % readableDigests.size()),
+                        0)) {
+                  // Acquire a reader reference before opening the gate. Otherwise the charger
+                  // threads can win the scheduler race and evict every candidate before either
+                  // reader runs, making this a scheduling test instead of a refcount test.
                   start.await();
-                  for (int s = 0; s < readsPerThread; s++) {
+                  ByteStreams.exhaust(initial);
+                  successfulReads.increment();
+                  for (int s = 1; s < readsPerThread; s++) {
                     Digest d = readableDigests.get(s % readableDigests.size());
                     try (InputStream in = fileCache.newInput(Compressor.Value.IDENTITY, d, 0)) {
                       ByteStreams.exhaust(in);
@@ -2432,13 +2442,13 @@ class CASFileCacheTest {
           }
 
           @Override
-          public Entry safeStorageRemoval(String key) throws IOException {
+          public Entry safeStorageRemoval(String key, long size) throws IOException {
             fail("referenced rollback victim must not reach storage removal");
             return null;
           }
 
           @Override
-          public void deleteExpiredKey(String key) {}
+          public void deleteExpiredKey(String key, long size) {}
 
           @Override
           public void expireEntryFallback(String key, long size) {}
@@ -2508,7 +2518,7 @@ class CASFileCacheTest {
         .isTrue();
 
     String key = path.getFileName().toString();
-    Path removingPath = fileCache.getRemovingPath(key);
+    Path removingPath = fileCache.getRemovingPath(digest, key);
     Files.createDirectories(removingPath.getParent());
     Files.write(removingPath, ByteString.copyFromUtf8("stale-expired-path").toByteArray());
     assertThat(Files.exists(removingPath)).isTrue();
@@ -2663,13 +2673,13 @@ class CASFileCacheTest {
           }
 
           @Override
-          public Entry safeStorageRemoval(String key) throws IOException {
+          public Entry safeStorageRemoval(String key, long size) throws IOException {
             removalAttempts.incrementAndGet();
             throw new IOException("injected detach failure");
           }
 
           @Override
-          public void deleteExpiredKey(String key) {}
+          public void deleteExpiredKey(String key, long size) {}
 
           @Override
           public void expireEntryFallback(String key, long size) {}
@@ -2796,9 +2806,8 @@ class CASFileCacheTest {
   public void startupShouldReclaimRemovedSuffixOrphans() throws Exception {
     // Synthesize an orphan _removed file in the bucket tree, then start the cache. The
     // orphan must be deleted by scanRoot before any real storage admission.
-    Path bucket =
-        fileCache.getPath(
-            fileCache.getKey(DIGEST_UTIL.compute(ByteString.copyFromUtf8("x")), false));
+    Digest bucketDigest = DIGEST_UTIL.compute(ByteString.copyFromUtf8("x"));
+    Path bucket = fileCache.getPath(bucketDigest, fileCache.getKey(bucketDigest, false));
     Files.createDirectories(bucket.getParent());
     Path orphan = bucket.getParent().resolve("orphan_removed");
     Files.write(orphan, new byte[16]);
@@ -3750,12 +3759,12 @@ class CASFileCacheTest {
           }
 
           @Override
-          public Entry safeStorageRemoval(String key) {
+          public Entry safeStorageRemoval(String key, long size) {
             return null;
           }
 
           @Override
-          public void deleteExpiredKey(String key) {}
+          public void deleteExpiredKey(String key, long size) {}
 
           @Override
           public void expireEntryFallback(String key, long size) {}
@@ -3831,7 +3840,7 @@ class CASFileCacheTest {
     assertThat(fileCache.size()).isEqualTo(sizeBefore);
     String key = fileCache.getKey(digest, false);
     assertThat(storage.containsKey(key)).isFalse();
-    assertThat(Files.exists(fileCache.getPath(key))).isFalse();
+    assertThat(Files.exists(fileCache.getPath(digest, key))).isFalse();
   }
 
   @Test
@@ -3872,12 +3881,12 @@ class CASFileCacheTest {
           }
 
           @Override
-          public Entry safeStorageRemoval(String key) {
+          public Entry safeStorageRemoval(String key, long size) {
             return null;
           }
 
           @Override
-          public void deleteExpiredKey(String key) {}
+          public void deleteExpiredKey(String key, long size) {}
 
           @Override
           public void expireEntryFallback(String key, long size) {}
@@ -3945,12 +3954,12 @@ class CASFileCacheTest {
           }
 
           @Override
-          public Entry safeStorageRemoval(String key) {
+          public Entry safeStorageRemoval(String key, long size) {
             return null;
           }
 
           @Override
-          public void deleteExpiredKey(String key) {}
+          public void deleteExpiredKey(String key, long size) {}
 
           @Override
           public void expireEntryFallback(String key, long size) {}
@@ -4015,12 +4024,12 @@ class CASFileCacheTest {
           }
 
           @Override
-          public Entry safeStorageRemoval(String key) {
+          public Entry safeStorageRemoval(String key, long size) {
             return null;
           }
 
           @Override
-          public void deleteExpiredKey(String key) {}
+          public void deleteExpiredKey(String key, long size) {}
 
           @Override
           public void expireEntryFallback(String key, long size) {}

@@ -457,7 +457,8 @@ class DirectoryEntryCFCTest {
       throws IOException, InterruptedException {
     PutDirectoryFixture f = putSingleFileDirectory(ByteString.copyFromUtf8("hardlink me"));
 
-    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path standalone =
+        fileCache.getPath(f.fileDigest(), CASFileCache.getKey(f.fileDigest(), false));
     Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
 
     assertThat(fileKeyOf(inDirectory)).isEqualTo(fileKeyOf(standalone));
@@ -515,7 +516,8 @@ class DirectoryEntryCFCTest {
     ByteString file = ByteString.copyFromUtf8("copy fallback content");
     PutDirectoryFixture f = putSingleFileDirectory(file);
 
-    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path standalone =
+        fileCache.getPath(f.fileDigest(), CASFileCache.getKey(f.fileDigest(), false));
     Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
 
     assertThat(fileKeyOf(inDirectory)).isNotEqualTo(fileKeyOf(standalone));
@@ -550,7 +552,8 @@ class DirectoryEntryCFCTest {
     ByteString file = ByteString.copyFromUtf8("null file key fallback");
     PutDirectoryFixture f = putSingleFileDirectory(file);
 
-    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path standalone =
+        fileCache.getPath(f.fileDigest(), CASFileCache.getKey(f.fileDigest(), false));
     Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
 
     assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
@@ -582,7 +585,10 @@ class DirectoryEntryCFCTest {
     Entry source = storage.get(CASFileCache.getKey(f.fileDigest(), false));
     assertThat(source.casDirectoryHardlinkCount()).isEqualTo(1);
     assertThat(fileKeyOf(inDirectory))
-        .isEqualTo(fileKeyOf(fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false))));
+        .isEqualTo(
+            fileKeyOf(
+                fileCache.getPath(
+                    f.fileDigest(), CASFileCache.getKey(f.fileDigest(), false))));
   }
 
   @Test
@@ -644,7 +650,8 @@ class DirectoryEntryCFCTest {
     ByteString file = ByteString.copyFromUtf8("refetch null file key fallback");
     PutDirectoryFixture f = putSingleFileDirectory(file);
 
-    Path standalone = fileCache.getPath(CASFileCache.getKey(f.fileDigest(), false));
+    Path standalone =
+        fileCache.getPath(f.fileDigest(), CASFileCache.getKey(f.fileDigest(), false));
     Path inDirectory = fileCache.getDirectoryPath(f.dirDigest()).resolve("file");
 
     assertThat(Files.readAllBytes(inDirectory)).isEqualTo(file.toByteArray());
@@ -893,7 +900,7 @@ class DirectoryEntryCFCTest {
     byte[] content = "startup hardlinked file".getBytes(StandardCharsets.UTF_8);
     Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
     String fileKey = CASFileCache.getKey(fileDigest, false);
-    Path standalone = fileCache.getPath(fileKey);
+    Path standalone = fileCache.getPath(fileDigest, fileKey);
     Files.write(standalone, content);
 
     Directory directory =
@@ -942,7 +949,7 @@ class DirectoryEntryCFCTest {
     byte[] content = "startup snapshot hardlinked file".getBytes(StandardCharsets.UTF_8);
     Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
     String fileKey = CASFileCache.getKey(fileDigest, false);
-    Path standalone = fileCache.getPath(fileKey);
+    Path standalone = fileCache.getPath(fileDigest, fileKey);
     Files.write(standalone, content);
 
     Directory directory =
@@ -1054,7 +1061,7 @@ class DirectoryEntryCFCTest {
     byte[] content = "valid standalone source".getBytes(StandardCharsets.UTF_8);
     Digest fileDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
     String fileKey = CASFileCache.getKey(fileDigest, false);
-    Path standalone = fileCache.getPath(fileKey);
+    Path standalone = fileCache.getPath(fileDigest, fileKey);
     Files.write(standalone, content);
 
     Digest dirDigest = DIGEST_UTIL.compute(ByteString.copyFromUtf8("invalid hardlink dir"));
@@ -1126,8 +1133,9 @@ class DirectoryEntryCFCTest {
     public void computeDirectoryIncludesDirectoryOverhead() throws Exception {
       byte[] content = "test content".getBytes(StandardCharsets.UTF_8);
       // The key must go through the entry path strategy (hex bucket directories).
-      String dirKey = fileCache.getDirectoryKey(DIGEST_UTIL.compute(ByteString.copyFrom(content)));
-      Path dirEntry = fileCache.getPath(dirKey);
+      Digest dirDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
+      String dirKey = fileCache.getDirectoryKey(dirDigest);
+      Path dirEntry = fileCache.getPath(dirDigest, dirKey);
       Files.createDirectories(dirEntry.resolve("subdir"));
       Files.write(dirEntry.resolve("file.txt"), content);
 

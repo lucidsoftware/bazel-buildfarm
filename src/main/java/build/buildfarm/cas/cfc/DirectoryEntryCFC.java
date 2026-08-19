@@ -580,7 +580,7 @@ public class DirectoryEntryCFC extends CASFileCache {
       try {
         return singleflightReFetchAndLink(srcDigest, isExecutable, srcKey, dst);
       } catch (NoSuchFileException e) {
-        if (!linkFailureMayBeMissingSource(e, getPath(srcKey))) {
+        if (!linkFailureMayBeMissingSource(e, getPath(srcDigest, srcKey))) {
           throw e;
         }
         if (attempt >= MAX_REFETCH_ATTEMPTS) {
