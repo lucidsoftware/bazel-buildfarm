@@ -1,9 +1,11 @@
 # Lucid Buildfarm fork inventory
 
-This inventory describes the Lucid-only history through internal branch
-`ssmith-buildfarm-use-fork-hardening`. That internal branch pins Buildfarm commit
-`cced39f72001a8b82d27f2eb2a8c388762965a12`. The comparison base for the old fork is
-`4110fd9f`; the clean update base is upstream `main` at
+This inventory describes the Lucid-only history through fork branch
+`ssmith-buildfarm-patches` at `86b5262cd56bfd241d0be95de09930902562a7c5`. The previously used cutoff,
+internal branch `ssmith-buildfarm-use-fork-hardening`, pins Buildfarm commit
+`cced39f72001a8b82d27f2eb2a8c388762965a12`; the corrected cutoff adds six ordered
+persistent-worker lifecycle commits after it. The comparison base for the old fork is `4110fd9f`;
+the clean update base is upstream `main` at
 `808050fac62ee81083762e5bd6cf5cd73ce29c86` (2026-08-19).
 
 No branch listed here has been pushed. `lucid-cleanup/pure-upstream` is an exact pointer to the
@@ -51,11 +53,15 @@ proposed to Buildfarm; it is not a claim that maintainers will accept it.
 | `redis-reconnect-backoff` | `5bb8f742` | Small | Ported | High. Focused reconnect-loop hardening. |
 | `provision-queue-metrics` | `f9299116` | Medium | Ported | Medium-high. Useful generic metric, but includes API/protobuf shape decisions. |
 | `allowlisted-remote-persistent-workers` | `cced39f7` | Medium | Ported | Medium. Depends on the persistent-worker branch family. Clearly document the allowlist and tool-input trust model. |
+| `persistent-worker-lifecycle-leases` | `8f843e2c`, `536cf989` | Large | Ported | High. Introduces explicit lifecycle leases and prevents timeout races with active workers. Depends on the earlier persistent-worker family. |
+| `persistent-worker-idle-eviction` | `a4dd5917`, `2b0fa497` | Large | Ported | Medium-high. Adds observable idle detection, pool-confirmed eviction, limits, and warm-idle policy. Submit after lifecycle leases. |
+| `persistent-worker-bounded-termination` | `136f92b1` | Medium | Ported | High. Bounds graceful process termination and records forced termination. Depends on idle-eviction configuration and lifecycle plumbing. |
+| `persistent-worker-pool-shutdown` | `86b5262c` | Medium | Ported | High. Closes the persistent-worker pool during worker shutdown. This is the final cumulative branch for the corrected cutoff. |
 | `cgroup-v2-memory` | new local fix (`1b7cc2e6` on its feature branch) | Small | Ported | High. Updates the memory controller to cgroup v2 (`memory.max`, `memory.swap.max`) and uses 64-bit parsing. This is newer than the named cutoff and is included because it enables current Buildfarm in Lucid's containers. |
 
 The two formatting-only old commits, `12f1c92f` and `19e198d4`, are not feature branches.
 `19e198d4` is represented upstream by `aad1cd4b`; `12f1c92f` has no behavioral delta worth
-carrying. This accounts for all 51 old commits: 46 retained changes were ported, three behavioral
+carrying. This accounts for all 57 old commits: 52 retained changes were ported, three behavioral
 changes are represented by upstream pointer branches, and two are formatting-only.
 
 ## Dependency families used by the reconstruction
@@ -66,13 +72,15 @@ same prerequisites twice:
 1. `directory-hardlinks` brings in CAS size accounting, percent sizing, the native-memory and
    upload lifecycle work, eviction diagnostics, symlink validation, atomic writes, CAS
    concurrency, and hardlink materialization/metrics.
-2. `allowlisted-remote-persistent-workers` brings in nobody handling, output-path movement,
-   persistent-worker lifecycle fixes, persistent-worker metrics, and remote persistent-worker
-   eligibility.
+2. `persistent-worker-pool-shutdown` brings in the complete persistent-worker family: nobody
+   handling, output-path movement, the earlier lifecycle fixes, metrics, remote-worker eligibility,
+   lifecycle leases, idle eviction, bounded termination, and pool shutdown.
 
 The reconstruction then adds the independent dynamic-width, Bzlmod, JSON logging, worker
-registration, Redis backoff, provision-queue metric, and cgroup-v2 features. Upstreamed pointer
-features require no reconstruction commit because they are already in the base.
+registration, Redis backoff, provision-queue metric, and cgroup-v2 features. The corrected-cutoff
+persistent-worker commits were applied after those existing reconstruction commits, with the same
+feature boundaries preserved. Upstreamed pointer features require no reconstruction commit because
+they are already in the base.
 
 ## Verification notes
 
@@ -89,6 +97,7 @@ only change was the same repository mirror substitution. That override is not pa
 Start with the small correctness changes (`cgroup-v2-memory`, `redis-reconnect-backoff`,
 `atomic-file-writer`, `cas-eviction-diagnostics`, and `dynamic-report-result-width`). Then submit
 the CAS sizing and upload-lifecycle series, followed by CAS concurrency and hardlinks. Submit the
-persistent-worker correctness series before its metrics and allowlisting changes. Keep Lucid
+persistent-worker correctness series before its metrics and allowlisting changes, then submit
+lifecycle leases, idle eviction, bounded termination, and pool shutdown in that order. Keep Lucid
 deployment/configuration changes outside Buildfarm PRs unless they expose a generally useful
 container contract.
