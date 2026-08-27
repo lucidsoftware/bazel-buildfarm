@@ -393,13 +393,13 @@ class CASFileCacheTest {
     // Two blobs with different sizes, both smaller than one block.
     ByteString blob1 = ByteString.copyFromUtf8("small");
     Digest digest1 = DIGEST_UTIL.compute(blob1);
-    Path path1 = fileCache.getPath(fileCache.getKey(digest1, false));
+    Path path1 = fileCache.getPath(digest1, fileCache.getKey(digest1, false));
     Files.write(path1, blob1.toByteArray());
     EvenMoreFiles.setReadOnlyPerms(path1, false, fileStore);
 
     ByteString blob2 = ByteString.copyFromUtf8("another small blob");
     Digest digest2 = DIGEST_UTIL.compute(blob2);
-    Path path2 = fileCache.getPath(fileCache.getKey(digest2, false));
+    Path path2 = fileCache.getPath(digest2, fileCache.getKey(digest2, false));
     Files.write(path2, blob2.toByteArray());
     EvenMoreFiles.setReadOnlyPerms(path2, false, fileStore);
 

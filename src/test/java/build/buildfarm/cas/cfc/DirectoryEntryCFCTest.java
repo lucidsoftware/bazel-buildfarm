@@ -460,8 +460,9 @@ class DirectoryEntryCFCTest {
     public void computeDirectoryIncludesDirectoryOverhead() throws Exception {
       byte[] content = "test content".getBytes(StandardCharsets.UTF_8);
       // The key must go through the entry path strategy (hex bucket directories).
-      String dirKey = fileCache.getDirectoryKey(DIGEST_UTIL.compute(ByteString.copyFrom(content)));
-      Path dirEntry = fileCache.getPath(dirKey);
+      Digest dirDigest = DIGEST_UTIL.compute(ByteString.copyFrom(content));
+      String dirKey = fileCache.getDirectoryKey(dirDigest);
+      Path dirEntry = fileCache.getPath(dirDigest, dirKey);
       Files.createDirectories(dirEntry.resolve("subdir"));
       Files.write(dirEntry.resolve("file.txt"), content);
 
