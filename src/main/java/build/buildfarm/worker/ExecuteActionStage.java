@@ -31,7 +31,24 @@ import lombok.extern.java.Log;
 @Log
 public class ExecuteActionStage extends PipelineStage {
   private static final Histogram executionTime =
-      Histogram.build().name("execution_time_ms").help("Execution time in ms.").register();
+      Histogram.build()
+          .name("execution_time_ms")
+          .help("Execution time in ms.")
+          .buckets(
+              100,
+              250,
+              500,
+              1000,
+              2500,
+              5000,
+              10000,
+              30000,
+              60000,
+              120000,
+              300000,
+              600000,
+              900000)
+          .register();
   private static final Histogram executionStallTime =
       Histogram.build()
           .name("execution_stall_time_ms")
