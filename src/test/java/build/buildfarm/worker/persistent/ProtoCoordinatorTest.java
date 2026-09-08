@@ -16,8 +16,11 @@ package build.buildfarm.worker.persistent;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -45,6 +48,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -52,6 +56,7 @@ import org.junit.runners.JUnit4;
 import persistent.bazel.client.CommonsWorkerPool;
 import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkerKey;
+import persistent.bazel.client.WorkerResources;
 
 @RunWith(JUnit4.class)
 public class ProtoCoordinatorTest {
@@ -549,5 +554,73 @@ public class ProtoCoordinatorTest {
 
     // Original file in the operation root should be untouched
     assertThat(Files.exists(inputFileInOpRoot)).isTrue();
+  }
+
+  @Test
+  public void sequentialOperationsQuiesceBeforeReturningTheSameWorker() throws Exception {
+    CommonsWorkerPool pool = mock(CommonsWorkerPool.class);
+    ProtoCoordinator coordinator = new ProtoCoordinator(pool);
+    coordinators.add(coordinator);
+    WorkerKey key = mock(WorkerKey.class);
+    PersistentWorker worker = mock(PersistentWorker.class);
+    Path root = Files.createTempDirectory("pw-leased-resources-");
+    AtomicBoolean idle = new AtomicBoolean(true);
+    WorkerResources resources =
+        new WorkerResources() {
+          public void resume() {
+            assertThat(idle.getAndSet(false)).isTrue();
+          }
+
+          public void idle() {
+            assertThat(idle.getAndSet(true)).isFalse();
+          }
+        };
+    when(worker.getResources()).thenReturn(resources);
+    when(worker.getExecRoot()).thenReturn(root);
+    when(worker.flushStdErr()).thenReturn("");
+    when(pool.obtain(key)).thenReturn(worker);
+    when(worker.doWork(any()))
+        .thenAnswer(
+            invocation -> {
+              assertThat(idle.get()).isFalse();
+              return WorkResponse.newBuilder().setOutput("done").build();
+            });
+    doAnswer(
+            invocation -> {
+              assertThat(idle.get()).isTrue();
+              return null;
+            })
+        .when(pool)
+        .release(key, worker);
+    coordinator.lifecycle.register(worker);
+    for (String operation : List.of("operation-a", "operation-b")) {
+      Path opRoot = root.resolve(operation);
+      WorkFilesContext files =
+          new WorkFilesContext(
+              opRoot,
+              Tree.getDefaultInstance(),
+              ImmutableList.of(),
+              ImmutableList.of(),
+              ImmutableList.of());
+      WorkerInputs inputs =
+          new WorkerInputs(opRoot, ImmutableSet.of(), ImmutableSet.of(), ImmutableMap.of());
+      RequestCtx request =
+          new RequestCtx(
+              WorkRequest.getDefaultInstance(),
+              files,
+              inputs,
+              Duration.newBuilder().setSeconds(30).build());
+      request.execution =
+          (leasedResources, work) -> {
+            leasedResources.resume();
+            return work.call();
+          };
+      assertThat(coordinator.runRequest(key, request).response.getOutput()).isEqualTo("done");
+      assertThat(coordinator.hasPendingRequest(request)).isFalse();
+    }
+    verify(pool, times(2)).release(key, worker);
+    verify(worker, times(2)).doWork(any());
+    verify(pool, never()).invalidate(key, worker);
+    Files.delete(root);
   }
 }

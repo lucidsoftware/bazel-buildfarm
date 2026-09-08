@@ -36,6 +36,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import lombok.extern.java.Log;
 import org.apache.commons.pool2.PooledObject;
@@ -43,6 +44,7 @@ import persistent.bazel.client.CommonsWorkerPool;
 import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkCoordinator;
 import persistent.bazel.client.WorkerKey;
+import persistent.bazel.client.WorkerResources;
 import persistent.bazel.client.WorkerSupervisor;
 
 /**
@@ -150,6 +152,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             Path keyExecRoot = workerKey.getExecRoot();
             String workerExecDir = getUniqueSubdir(keyExecRoot);
             Path workerExecRoot = keyExecRoot.resolve(workerExecDir);
+            Files.createDirectories(workerExecRoot);
             long toolSetupStarted = PersistentWorkerMetrics.startTimer();
             try {
               copyToolsIntoWorkerExecRoot(workerKey, workerExecRoot);
@@ -321,7 +324,10 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       WorkResponse workResponse;
       long executionStarted = PersistentWorkerMetrics.startTimer();
       try {
-        workResponse = worker.doWork(workRequest);
+        WorkerResources resources = lifecycle.resourcesFor(lease);
+        workResponse = request.execution.run(resources, () -> worker.doWork(workRequest));
+        // Quiesce the process before copying outputs or making it available to another lease.
+        resources.idle();
       } finally {
         PersistentWorkerMetrics.observePhase(
             PersistentWorkerMetrics.PHASE_WORKER_EXECUTION, executionStarted);
@@ -345,6 +351,9 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       request.setOutcome(completedOutcome);
       return responseAfterCleanup;
     } catch (Exception e) {
+      if (e instanceof TimeoutException) {
+        request.markTimedOut();
+      }
       if (e instanceof InterruptedException) {
         request.setOutcome(PersistentWorkerMetrics.OUTCOME_INTERRUPTED);
       } else if (request.timedOut()) {

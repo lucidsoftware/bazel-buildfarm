@@ -51,6 +51,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.devtools.build.lib.shell.Protos.ExecutionStatistics;
+import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Any;
 import com.google.protobuf.ByteString;
@@ -72,11 +73,16 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import javax.annotation.Nullable;
 import lombok.extern.java.Log;
+import persistent.bazel.client.WorkerResources;
 
 @Log
 public class Executor {
@@ -643,15 +649,25 @@ public class Executor {
               "usePersistentWorker (mnemonic=%s)",
               executionContext.metadata.getRequestMetadata().getActionMnemonic()));
 
+      WorkerResources.Profile profile =
+          workerContext.persistentWorkerResources(executionContext.command);
+      // Keep a generation-guarded watchdog over setup and execution. The shared monitor can
+      // extend market execution once, so the watchdog must allow that same maximum duration.
+      Duration watchdogTimeout =
+          executionContext.marketExecution && profile != WorkerResources.Profile.NONE
+              ? add(timeout, timeout)
+              : timeout;
       return PersistentExecutor.runOnPersistentWorker(
           persistentWorkerFilesContext,
           executionName,
           ImmutableList.copyOf(processBuilder.command()),
           ImmutableMap.copyOf(processBuilder.environment()),
           limits,
-          timeout,
+          watchdogTimeout,
           PersistentExecutor.defaultWorkRootsDir,
-          resultBuilder);
+          resultBuilder,
+          profile,
+          (resources, work) -> executePersistentRequest(resources, work, timeout));
     }
 
     // run the action under docker
@@ -789,9 +805,14 @@ public class Executor {
     }
   }
 
+  @FunctionalInterface
+  interface Completion {
+    boolean await(long nanos) throws IOException, InterruptedException;
+  }
+
   private Code pollingExecution(
       String executionName,
-      Process process,
+      Completion completion,
       Duration timeout,
       IOResource resource,
       boolean marketExecution,
@@ -807,9 +828,8 @@ public class Executor {
       if (marketExecution || order.balance() != 0) {
         nsWait = Math.min(nsWait, SAMPLE_NANOS);
       }
-      if (process.waitFor(nsWait, TimeUnit.NANOSECONDS)) {
+      if (completion.await(Math.max(0, nsWait))) {
         recordUsage(periodShares, lastUsage.nrPeriods(), resource.sample());
-        exitCode = process.exitValue();
         return Code.OK;
       }
 
@@ -854,6 +874,12 @@ public class Executor {
 
       if (marketExecution) {
         Map<String, Long> sample = resource.sample();
+        if (!sample
+            .keySet()
+            .containsAll(
+                List.of(SAMPLE_CPU_NR_PERIODS, SAMPLE_CPU_USAGE_USEC, SAMPLE_CPU_THROTTLED_USEC))) {
+          throw new IOException("Missing cgroup CPU accounting samples");
+        }
         long nrPeriods = sample.get(SAMPLE_CPU_NR_PERIODS);
         long usCpuUsed = sample.get(SAMPLE_CPU_USAGE_USEC);
         long usCpuThrottled = sample.get(SAMPLE_CPU_THROTTLED_USEC);
@@ -868,6 +894,88 @@ public class Executor {
 
         lastUsage = usage;
       }
+    }
+  }
+
+  @VisibleForTesting
+  WorkResponse executePersistentRequest(
+      WorkerResources resources, Callable<WorkResponse> work, Duration timeout) throws Exception {
+    CPULease cpuLease = (CPULease) executionContext.claim.get(CPULease.RESOURCE_NAME);
+    shares = cpuLease.amount();
+    resources.setCpu(shares * 100);
+    Map<String, Long> baseline = resources.sample();
+    IOResource requestResource =
+        new IOResource() {
+          public void close() {}
+
+          public boolean isReferenced() {
+            return false;
+          }
+
+          public void setCpu(int micros) throws IOException {
+            resources.setCpu(micros);
+          }
+
+          public Map<String, Long> sample() {
+            Map<String, Long> delta = new HashMap<>(resources.sample());
+            for (String counter :
+                List.of(
+                    SAMPLE_CPU_USAGE_USEC,
+                    SAMPLE_CPU_THROTTLED_USEC,
+                    SAMPLE_CPU_NR_PERIODS,
+                    "cpu.nr_throttled",
+                    "cpu.user_usec",
+                    "cpu.system_usec")) {
+              if (delta.containsKey(counter)) {
+                delta.put(
+                    counter, Math.max(0, delta.get(counter) - baseline.getOrDefault(counter, 0L)));
+              }
+            }
+            return delta;
+          }
+        };
+    resources.resume();
+    FutureTask<WorkResponse> response = new FutureTask<>(work);
+    Thread reader = new Thread(response, "persistent-worker-request");
+    reader.setDaemon(true);
+    reader.start();
+    try {
+      Code status =
+          pollingExecution(
+              executionContext.operation.getName(),
+              nanos -> {
+                try {
+                  response.get(nanos, TimeUnit.NANOSECONDS);
+                  return true;
+                } catch (TimeoutException e) {
+                  return false;
+                } catch (ExecutionException e) {
+                  // Surface the original failure below, through the coordinator's invalidation
+                  // path.
+                  return true;
+                }
+              },
+              timeout,
+              requestResource,
+              executionContext.marketExecution && resources != WorkerResources.NONE,
+              cpuLease);
+      if (status != Code.OK) {
+        throw new TimeoutException("Persistent worker request timed out");
+      }
+      try {
+        WorkResponse result = response.get();
+        exitCode = result.getExitCode();
+        return result;
+      } catch (ExecutionException e) {
+        if (e.getCause() instanceof Exception cause) {
+          throw cause;
+        }
+        throw e;
+      }
+    } finally {
+      order.cancel();
+      response.cancel(true);
+      // The coordinator retires and terminates the process on failure, unblocking its reader.
     }
   }
 
@@ -932,7 +1040,16 @@ public class Executor {
         executionContext.workerExecutedMetadata.putAllUsage(resource.sample());
       } else {
         statusCode =
-            pollingExecution(executionName, process, timeout, resource, marketExecution, cpuLease);
+            pollingExecution(
+                executionName,
+                nanos -> process.waitFor(nanos, TimeUnit.NANOSECONDS),
+                timeout,
+                resource,
+                marketExecution,
+                cpuLease);
+        if (statusCode == Code.OK) {
+          exitCode = process.exitValue();
+        }
       }
       processCompleted = true;
     } finally {

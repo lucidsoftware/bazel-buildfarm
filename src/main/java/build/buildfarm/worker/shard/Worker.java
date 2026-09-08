@@ -956,8 +956,6 @@ public final class Worker extends LoggingMain {
   private void shutdown() throws InterruptedException {
     log.info("*** shutting down gRPC server since JVM is shutting down");
     prepareWorkerForGracefulShutdown();
-    // Clean-up any cgroups that were possibly created/mutated.
-    Group.onShutdown();
     PrometheusPublisher.stopHttpServer();
     boolean interrupted = Thread.interrupted();
     if (pipeline != null) {
@@ -970,6 +968,8 @@ public final class Worker extends LoggingMain {
       }
     }
     PersistentExecutor.shutdown();
+    // Process owners must finish before the shared cgroup hierarchy is dismantled.
+    Group.onShutdown();
     healthStatusManager.setStatus(
         HealthStatusManager.SERVICE_NAME_ALL_SERVICES, ServingStatus.NOT_SERVING);
     healthCheckMetric.labels("stop").inc();
