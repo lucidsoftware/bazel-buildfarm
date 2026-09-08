@@ -84,6 +84,7 @@ public class BuildfarmConfigsTest {
     String yamlContent =
         "worker:\n"
             + "  persistentWorkers:\n"
+            + "    poolWaitTimeoutMillis: 250\n"
             + "    maxWorkersPerKey: 4\n"
             + "    maxWorkersTotal: 40\n"
             + "    warmIdleWorkersPerKey: 1\n"
@@ -95,6 +96,7 @@ public class BuildfarmConfigsTest {
 
     BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
     PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
+    assertEquals(250L, settings.getPoolWaitTimeoutMillis());
     assertEquals(4, settings.getMaxWorkersPerKey());
     assertEquals(40, settings.getMaxWorkersTotal());
     assertEquals(1, settings.getWarmIdleWorkersPerKey());
@@ -110,6 +112,14 @@ public class BuildfarmConfigsTest {
     settings.setMaxWorkersPerKey(2);
     settings.setWarmIdleWorkersPerKey(3);
 
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsNegativePoolWait() {
+    PersistentWorkers settings = new PersistentWorkers();
+    settings.setPoolWaitTimeoutMillis(-1);
     assertThrows(
         ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
   }

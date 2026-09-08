@@ -39,6 +39,7 @@ import java.util.logging.Level;
 import lombok.extern.java.Log;
 import persistent.bazel.client.WorkerKey;
 import persistent.bazel.client.WorkerResources;
+import persistent.common.PoolExhaustedException;
 
 /**
  * Executes an Action like Executor/DockerExecutor, writing to ActionResult.
@@ -256,6 +257,9 @@ public class PersistentExecutor {
 
       response = fullResponse.response;
       stdErr = fullResponse.errorString;
+    } catch (PoolExhaustedException e) {
+      // No request was submitted: the executor can safely rebuild the native execution path.
+      throw e;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw e;

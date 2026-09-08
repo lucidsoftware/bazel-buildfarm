@@ -41,6 +41,31 @@ its pipes if it is blocked in protocol I/O. The coordinator retains its lease-gu
 covering setup/execution. For market executions this permits twice the original action timeout,
 matching the monitor's single extension, while imposing a hard bound including input setup.
 
+## Pool contention and native fallback
+
+The execution stage claims CPU capacity before obtaining a compatible persistent worker.
+Waiting indefinitely for a busy key or a full global PW pool can therefore reserve most of a
+machine's execution capacity without running useful work.
+
+`worker.persistentWorkers.poolWaitTimeoutMillis` bounds this pool-contention wait (default
+1000 milliseconds; zero attempts immediate acquisition/creation and falls back when full).
+The borrow wait is also capped by the supplied request timeout. Tool setup and creation of a
+new process are synchronous operations, not bounded by this pool-contention timer.
+
+Only a pool-exhaustion result before acquiring a process permits native fallback. Startup,
+validation, protocol, cleanup, and execution failures do not trigger a second execution.
+Interrupted requests do not fall back. The executor closes the initial resource handle and
+rebuilds the original command with native wrappers, ownership handling, and per-operation
+cgroup enforcement. It retains the existing execution claim and subtracts elapsed attempt
+time from the original timeout; an expired budget returns DEADLINE_EXCEEDED without launching.
+The fallback does not occupy a PW-pool slot and remains subject to normal execution capacity.
+
+`persistent_worker_requests_total{outcome="pool_timeout"}` records the unsuccessful PW
+acquisition. `persistent_worker_fallbacks_total` counts transitions into native execution,
+not successful native completions. A pool timeout can therefore precede a successful action.
+Native fallback work does not increment the PW successful-request counter. Compare fallback
+counts with pool waiters and normal action outcomes when testing saturation.
+
 ## Idle CPU and memory policy
 
 Idle managed workers are frozen, with confirmation bounded to five seconds. They consume no

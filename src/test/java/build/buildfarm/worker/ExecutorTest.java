@@ -21,11 +21,22 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import build.bazel.remote.execution.v2.ActionResult;
+import build.bazel.remote.execution.v2.Command;
 import build.buildfarm.common.Claim;
+import build.buildfarm.v1test.QueueEntry;
+import build.buildfarm.worker.persistent.WorkFilesContext;
+import build.buildfarm.worker.resources.ResourceLimits;
 import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Duration;
+import com.google.protobuf.util.Durations;
+import com.google.rpc.Code;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -34,8 +45,154 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Test;
 import persistent.bazel.client.WorkerResources;
+import persistent.common.PoolExhaustedException;
 
 public class ExecutorTest {
+  @Test
+  public void fallbackRebuildsNativeWrappersAndClosesBothResourceHandles() throws Exception {
+    WorkerContext workerContext = mock(WorkerContext.class);
+    WorkerContext.IOResource pwResource = mock(WorkerContext.IOResource.class);
+    WorkerContext.IOResource nativeResource = mock(WorkerContext.IOResource.class);
+    Claim claim = mock(Claim.class);
+    when(claim.getPools()).thenReturn(List.of());
+    ExecutionContext context =
+        ExecutionContext.newBuilder()
+            .setOperation(Operation.newBuilder().setName("fallback").build())
+            .setExecDir(Path.of("/tmp/pw-fallback-test"))
+            .setCommand(
+                Command.newBuilder()
+                    .addArguments("compiler")
+                    .addArguments("@request.params")
+                    .build())
+            .setQueueEntry(QueueEntry.getDefaultInstance())
+            .setClaim(claim)
+            .build();
+    doAnswer(
+            invocation -> {
+              boolean persistent = invocation.getArgument(5);
+              ImmutableList.Builder<String> args = invocation.getArgument(2);
+              args.add(persistent ? "pw-wrapper" : "native-cgroup-wrapper");
+              if (!persistent) {
+                verify(pwResource).close();
+              }
+              return persistent ? pwResource : nativeResource;
+            })
+        .when(workerContext)
+        .limitExecution(
+            org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.isNull(),
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
+    Executor executor =
+        new Executor(workerContext, context, null, 100, 20, 20, 100, 1000, Runnable::run) {
+          @Override
+          Code executeCommand(
+              String name,
+              Path dir,
+              List<String> arguments,
+              List<Command.EnvironmentVariable> environment,
+              ResourceLimits limits,
+              WorkerContext.IOResource resource,
+              WorkFilesContext files,
+              Duration timeout,
+              ActionResult.Builder result)
+              throws IOException {
+            if (files != null) {
+              assertThat(arguments)
+                  .containsExactly("pw-wrapper", "compiler", "@request.params")
+                  .inOrder();
+              throw new PoolExhaustedException(null);
+            }
+            assertThat(arguments)
+                .containsExactly("native-cgroup-wrapper", "compiler", "@request.params")
+                .inOrder();
+            assertThat(resource).isSameInstanceAs(nativeResource);
+            return Code.OK;
+          }
+        };
+    var files = mock(WorkFilesContext.class);
+    assertThat(
+            Executor.executeWithPoolFallback(
+                Duration.newBuilder().setSeconds(5).build(),
+                (persistent, remaining) ->
+                    executor.executeAttempt(
+                        new ResourceLimits(),
+                        ImmutableList.of(),
+                        remaining,
+                        persistent ? files : null)))
+        .isEqualTo(Code.OK);
+    verify(pwResource).close();
+    verify(nativeResource).close();
+  }
+
+  @Test
+  public void poolExhaustionRetriesNativeWithRemainingBudget() throws Exception {
+    List<Boolean> attempts = new ArrayList<>();
+    Duration budget = Duration.newBuilder().setSeconds(5).build();
+    var result =
+        Executor.executeWithPoolFallback(
+            budget,
+            (persistent, remaining) -> {
+              attempts.add(persistent);
+              if (persistent) {
+                throw new PoolExhaustedException(null);
+              }
+              assertThat(Durations.toNanos(remaining)).isLessThan(Durations.toNanos(budget));
+              assertThat(Durations.toNanos(remaining)).isGreaterThan(0);
+              return Code.OK;
+            });
+    assertThat(result).isEqualTo(Code.OK);
+    assertThat(attempts).containsExactly(true, false).inOrder();
+  }
+
+  @Test
+  public void expiredBudgetDoesNotStartNativeFallback() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    assertThat(
+            Executor.executeWithPoolFallback(
+                Duration.getDefaultInstance(),
+                (persistent, timeout) -> {
+                  attempts.incrementAndGet();
+                  throw new PoolExhaustedException(null);
+                }))
+        .isEqualTo(Code.DEADLINE_EXCEEDED);
+    assertThat(attempts.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void workerFailureDoesNotRetryNative() {
+    AtomicInteger attempts = new AtomicInteger();
+    assertThrows(
+        IOException.class,
+        () ->
+            Executor.executeWithPoolFallback(
+                Duration.newBuilder().setSeconds(5).build(),
+                (persistent, timeout) -> {
+                  attempts.incrementAndGet();
+                  throw new IOException("worker launch failed");
+                }));
+    assertThat(attempts.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void interruptedWaitDoesNotRetryNative() {
+    AtomicInteger attempts = new AtomicInteger();
+    try {
+      assertThrows(
+          InterruptedException.class,
+          () ->
+              Executor.executeWithPoolFallback(
+                  Duration.newBuilder().setSeconds(5).build(),
+                  (persistent, timeout) -> {
+                    attempts.incrementAndGet();
+                    Thread.currentThread().interrupt();
+                    throw new PoolExhaustedException(null);
+                  }));
+      assertThat(attempts.get()).isEqualTo(1);
+    } finally {
+      Thread.interrupted();
+    }
+  }
+
   @Test
   public void persistentWorkerAllowsMarkedExecutableForAllowlistedMnemonic() {
     assertThat(

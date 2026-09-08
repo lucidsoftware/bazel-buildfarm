@@ -28,7 +28,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,6 +45,7 @@ import persistent.bazel.client.WorkCoordinator;
 import persistent.bazel.client.WorkerKey;
 import persistent.bazel.client.WorkerResources;
 import persistent.bazel.client.WorkerSupervisor;
+import persistent.common.PoolExhaustedException;
 
 /**
  * Responsible for:
@@ -104,6 +104,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     return toolInputSyncs.computeIfAbsent(key, k -> k);
   }
 
+  private Duration poolWaitTimeout = Duration.ofMillis(1000);
+
   public ProtoCoordinator(CommonsWorkerPool workerPool) {
     super(workerPool);
     lifecycle = new PersistentWorkerLifecycle();
@@ -129,6 +131,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
                 lifecycle,
                 Duration.ofSeconds(settings.getIdleTimeoutSeconds()),
                 settings.getWarmIdleWorkersPerKey())));
+    this.poolWaitTimeout = Duration.ofMillis(settings.getPoolWaitTimeoutMillis());
     this.lifecycle = lifecycle;
     this.idleMonitor = idleMonitor;
   }
@@ -230,6 +233,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   private static void validateSettings(int maxWorkersPerKey, PersistentWorkers settings) {
     checkNotNull(settings);
     checkNotNull(settings.getIdleRetirementMode());
+    checkArgument(
+        settings.getPoolWaitTimeoutMillis() >= 0, "poolWaitTimeoutMillis must not be negative");
     checkArgument(maxWorkersPerKey > 0, "maxWorkersPerKey must be positive");
     checkArgument(
         settings.getMaxWorkersTotal() == -1 || settings.getMaxWorkersTotal() > 0,
@@ -296,11 +301,15 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     long poolWaitStarted = PersistentWorkerMetrics.startTimer();
     PersistentWorkerMetrics.poolWaitStarted();
     try {
-      worker = workerPool.obtain(workerKey);
+      Duration requestBudget = Duration.ofNanos(Math.max(0, Durations.toNanos(request.timeout)));
+      worker =
+          workerPool.obtain(
+              workerKey,
+              poolWaitTimeout.compareTo(requestBudget) < 0 ? poolWaitTimeout : requestBudget);
     } catch (Exception e) {
       if (e instanceof InterruptedException) {
         request.setOutcome(PersistentWorkerMetrics.OUTCOME_INTERRUPTED);
-      } else if (hasCause(e, NoSuchElementException.class)) {
+      } else if (e instanceof PoolExhaustedException) {
         request.setOutcome(PersistentWorkerMetrics.OUTCOME_POOL_TIMEOUT);
       } else {
         request.setOutcome(PersistentWorkerMetrics.OUTCOME_WORKER_ERROR);
@@ -389,15 +398,6 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     String operationName =
         request.filesContext == null ? "" : request.filesContext.opRoot.toString();
     return operationName + "#" + Integer.toUnsignedString(System.identityHashCode(request));
-  }
-
-  private static boolean hasCause(Throwable error, Class<? extends Throwable> causeClass) {
-    for (Throwable cause = error; cause != null; cause = cause.getCause()) {
-      if (causeClass.isInstance(cause)) {
-        return true;
-      }
-    }
-    return false;
   }
 
   public void copyToolInputsIntoWorkerToolRoot(WorkerKey key, WorkerInputs workerFiles)
